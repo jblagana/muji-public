@@ -148,7 +148,7 @@
     input: $("input"), sendBtn: $("send-btn"), stopBtn: $("stop-btn"), composerHint: $("composer-hint"),
     composerStatus: $("composer-status"), resumeChip: $("resume-chip"),
     abandonChip: $("abandon-chip"),
-    queueChip: $("queue-chip"),
+    queueTray: $("queue-tray"),
     scrollBottomBtn: $("scroll-bottom-btn"),
     supStrip: $("sup-strip"), supSummary: $("sup-summary"), supBoard: $("sup-board"),
     learnBanner: $("learn-banner"), learnCount: $("learn-count"), learnList: $("learn-list"),
@@ -2190,13 +2190,14 @@
             openStream(sid, 0);  // replay failed — fall back to the ring
         });
       }
-          syncQueueFromServer(sid);  // queue chip: the server is authoritative
+          syncQueueFromServer(sid);  // queue tray: the server is authoritative
         }  // end re-attach (genuine gap / switch / reload) vs keep-turn
     } else {
       setProcessing(false);
       closeStream(sid);
-      state.queues[sid] = [];
-      renderQueueChip(sid);
+      // not processing — the queue is server-authoritative too (a durable
+      // row can exist with no live run); sync, don't assume empty
+      syncQueueFromServer(sid);
       // stopped mid-air? — and state.resumable tells ↻ whether the server
       // can re-enter the saved loop state (true) or will do a plain
       // fresh-turn nudge (false).
@@ -3274,6 +3275,14 @@
     if (name === "queued") {
       // a message joined/leaved this session's queue — the server is
       // authoritative, so re-sync the real entries (text + files)
+      // `fired` (drain-announce) = the text of the entry that JUST left the
+      // queue to run. Stash it: the next `status` frame (the fired run's
+      // first event) draws its user bubble from this — the AUTHORITATIVE
+      // source, because the client's local peek (v._nextJob / state.queues)
+      // is empty when the item was queued from ANOTHER tab. This event rides
+      // the new run's buffer and is replayed BEFORE the status frame, so the
+      // stash is set by the time the status branch runs.
+      if (d.fired) view(sid)._firedText = d.fired;
       syncQueueFromServer(sid);
       return;
     }
@@ -3327,6 +3336,30 @@
           // the server drained the queue and the NEXT run just started —
           // this status frame is its first event, so the real turn for it
           // is created HERE (the placeholder was dropped in drainQueue)
+          // The fired message's USER bubble is created HERE too: the busy
+          // branch of send() no longer draws one (no bubble while queued),
+          // so without this the fired turn's answer would sit above the
+          // PREVIOUS user bubble — the "no user bubble until reload" bug.
+          // drainQueue() peeked the head's text into v._nextJob before the
+          // server popped it; the server's durable history row is the
+          // fallback if the local peek was empty.
+          // Text source, in order of authority: (1) the drain-announce
+          // stash — the server told us exactly what fired, replayed before
+          // this status frame; (2) the local peek (v._nextJob, set by
+          // drainQueue) for same-tab sends; (3) the local queue head —
+          // the server pops in its finally a beat AFTER our `done` frame,
+          // so for a missed drain-announce the head still holds the entry.
+          const firedEntry = (state.queues[sid] || [])[0];
+          const fired = v._firedText
+            || v._nextJob
+            || (firedEntry && (firedEntry.text || "(attachment)"))
+            || "(attachment)";
+          v._firedText = null;  // consumed — one bubble per fired entry
+          // internal nudges (auto-resume / execute-plan) render as their
+          // compact markers, not as raw user bubbles — same rule as history
+          if (fired === RESUME_TEXT) addResumeMarker();
+          else if (fired === EXECUTE_PLAN_TEXT) addPlanMarker();
+          else addUserMessage(fired);
           const nt = addAssistantTurn();
           nt.firstSeq = d.seq;  // this run's first frame (replay_gap filter)
           nt.start = Date.now();
@@ -3343,6 +3376,14 @@
           v._nextJob = null;
           thinkLabel(nt, d.text || "Working…");
           progressPhase(d.text || "Working…");
+          // Avatar handoff: addAssistantTurn's consecutive-avatar check saw
+          // the previous assistant row and hid this turn's avatar
+          // (msg-avatar-spacer) — designed for back-to-back assistant turns,
+          // wrong for a queue drain: the fired message is a NEW user send,
+          // it deserves its own avatar, or the old turn's avatar looks
+          // "stuck" (the "avatar didn't slide" bug). Show it.
+          nt.group.querySelector(".msg-avatar")
+            ?.classList.remove("msg-avatar-spacer");
           scrollToBottom(true);
         } else {
           if (turn) thinkLabel(turn, d.text || "Working…");
@@ -3464,6 +3505,22 @@
         // The server is authoritative — if the local queue is empty (another
         // tab queued it), ask the server before deciding to close the stream.
         drainQueue(sid);
+        // Drain resync: the server pops the head in its own finally (a
+        // moment after our `done` frame) and announces it on the `queued`
+        // channel — but that event rides the NEW run's buffer, which this
+        // stream may not replay (the onerror reconnect re-subscribes from
+        // the old run's seq; the replay only carries it if the client
+        // reattaches after the new run's first frame). A delayed resync
+        // after the handoff gap makes the server's post-drain list
+        // authoritative again — the tray row (or its absence) settles
+        // either way. NOTE: the guard must NOT be v.draining — the next
+        // run's `status` frame clears it well before this timer fires,
+        // which is exactly when the resync is still needed.
+        if ((state.queues[sid] || []).length || v._nextJob) {
+          setTimeout(() => {
+            if (state.sessionId === sid) syncQueueFromServer(sid);
+          }, 1500);
+        }
         // Pre-flip: the user toggled Plan→Act WHILE this plan turn was still
         // generating. The toggle only changes the mode (execution needs a
         // finished plan), so the flip never fired — and the Act button is
@@ -3519,15 +3576,10 @@
         if (sid === state.sessionId) markViewed(sid);
         refreshSessions();
         // Stop = stop everything: the server dropped the queue too
-        // (queued_dropped), so the placeholders are gone as well.
-        if (state.queues[sid]) {
-          state.queues[sid].forEach((e) => {
-            if (e._turn && e._turn.root && e._turn.root.isConnected)
-              e._turn.root.remove();
-          });
-          state.queues[sid] = [];
-        }
-        renderQueueChip(sid);
+        // (queued_dropped), so the tray rows are gone as well.
+        state.queues[sid] = [];
+        if (queueEditIndex >= 0) queueEditIndex = -1;
+        renderQueueTray(sid);
         break;
       case "error":
         v.done = true;
@@ -3689,13 +3741,13 @@
           autosize();
           clearAttachments();
           try { localStorage.removeItem("muji.draft"); } catch (e) {}
-          addUserMessage(text, files, Date.now());  // empty text + files → thumbnail only
+          // No transcript bubble while queued — the queue is pipeline
+          // state and the tray is its only view. (The old bubble was
+          // in-memory and vanished on reload anyway; the tray survives.)
           const entry = { text, files };
           (state.queues[state.sessionId] =
            state.queues[state.sessionId] || []).push(entry);
-          entry._turn = addQueuedTurn(text || "(attachment)");
-          renderQueueChip(state.sessionId);
-          scrollToBottom(true);
+          renderQueueTray(state.sessionId);
           // The SERVER is the queue — ship the message to it NOW. If we only
           // kept it in state.queues, the drain (which runs server-side the
           // moment the current run ends) would fire the NEXT queued message
@@ -3707,18 +3759,16 @@
           }).then((res) => res.json().catch(() => ({})))
             .then((body) => {
               if (body && body.ok) {
-                // the server accepted it — its `queued` event (and the chip
+                // the server accepted it — its `queued` event (and the tray
                 // sync it triggers) is the live confirmation
                 syncQueueFromServer(state.sessionId);
               } else {
-                // the server rejected it (offline, bad session) — the queue
-                // chip is a lie now; drop the entry + placeholder and say so
+                // the server rejected it (offline, bad session) — the tray
+                // is a lie now; drop the entry and say so
                 const q = state.queues[state.sessionId] || [];
                 const i = q.indexOf(entry);
                 if (i >= 0) q.splice(i, 1);
-                if (entry._turn && entry._turn.root && entry._turn.root.isConnected)
-                  entry._turn.root.remove();
-                renderQueueChip(state.sessionId);
+                renderQueueTray(state.sessionId);
                 const err = document.createElement("div");
                 err.className = "msg-error";
                 err.textContent = "Couldn't queue this message — " +
@@ -3731,9 +3781,7 @@
               const q = state.queues[state.sessionId] || [];
               const i = q.indexOf(entry);
               if (i >= 0) q.splice(i, 1);
-              if (entry._turn && entry._turn.root && entry._turn.root.isConnected)
-                entry._turn.root.remove();
-              renderQueueChip(state.sessionId);
+              renderQueueTray(state.sessionId);
             });
         }
         return;
@@ -3767,49 +3815,195 @@
   // While a run is in flight, new messages wait in state.queues[sid] (and
   // the server's own queue, which is authoritative). The moment a run
   // fully ends, drainQueue() fires the next one. The server pushes a
-  // `queued` event whenever the count changes, so the chip stays in sync
+  // `queued` event whenever the queue changes, so the tray stays in sync
   // even when the message came from ANOTHER tab.
-  function renderQueueChip(sid) {
-    const n = (state.queues[sid] || []).length;
-    const chip = el.queueChip;
-    if (!n) { chip.hidden = true; chip.textContent = ""; }
-    else {
-      chip.hidden = false;
-      chip.textContent = n === 1
-        ? "1 message queued — runs next"
-        : n + " messages queued — run in order";
-    }
-    el.composerStatus.hidden = el.resumeChip.hidden && el.abandonChip.hidden && chip.hidden;
-  }
+  //
+  // The tray is the ONLY queue view: it renders from state.queues, which
+  // syncQueueFromServer() rebuilds from GET /queue — so the ✎/✕/clear-all
+  // controls survive a tab reload by construction. (The old transcript
+  // placeholders were in-memory and died on reload, leaving only a dumb
+  // non-cancellable chip behind — that was the bug this replaces.)
+  let queueExpanded = false;  // the tray is COLLAPSED by default
+  let queueEditIndex = -1;    // the item currently in inline-edit mode
 
-  // A queued message's placeholder turn: "⏳ Queued" chip + a ✕ to cancel
-  // it. Replaced in place by the real turn when the queue drains.
-  function addQueuedTurn(text) {
-    const t = addAssistantTurn();
-    t.row.hidden = false;
-    t.finished = true;  // terminal handlers skip it
-    t.queued = true;
-    thinkLabel(t, "⏳ Queued — runs when the current task finishes");
-    t.cancelBtn = document.createElement("button");
-    t.cancelBtn.className = "mini-btn queued-cancel";
-    t.cancelBtn.textContent = "✕";
-    t.cancelBtn.title = "Cancel this queued message";
-    t.cancelBtn.addEventListener("click", () => cancelQueued(state.sessionId, t));
-    t.row.appendChild(t.cancelBtn);
-    t.root._queuedTurn = t;
-    return t;
-  }
-
-  function cancelQueued(sid, turn) {
+  function renderQueueTray(sid) {
+    const tray = el.queueTray;
     const q = state.queues[sid] || [];
-    const i = q.findIndex((e) => e && e._turn === turn);
-    if (i < 0) return;
+    const n = q.length;
+    if (!n) {
+      tray.hidden = true;
+      tray.innerHTML = "";
+      queueEditIndex = -1;
+      return;
+    }
+    tray.hidden = false;
+    tray.innerHTML = "";
+
+    // The head IS the fold — clicking it (anywhere except clear-all)
+    // toggles expand/collapse. Collapsed = ONE line with the "next:"
+    // preview.
+    const head = document.createElement("div");
+    head.className = "qt-head qt-foldable";
+    const arrow = document.createElement("span");
+    arrow.className = "qt-arrow";
+    arrow.textContent = queueExpanded ? "▾" : "▸";
+    head.appendChild(arrow);
+    const label = document.createElement("span");
+    label.className = "qt-count";
+    label.textContent = (n === 1 ? "1 queued" : n + " queued")
+      + (queueExpanded ? "" : " · next: " +
+        ((q[0] && q[0].text || "(attachment)").slice(0, 80)));
+    head.appendChild(label);
+    const clearBtn = document.createElement("button");
+    clearBtn.className = "qt-clear";
+    clearBtn.textContent = "clear all";
+    clearBtn.title = "Drop every queued message";
+    clearBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      clearQueueAll(sid);
+    });
+    head.appendChild(clearBtn);
+    head.title = queueExpanded ? "Collapse the queue" : "Expand the queue";
+    head.addEventListener("click", () => {
+      queueExpanded = !queueExpanded;
+      renderQueueTray(sid);
+    });
+    tray.appendChild(head);
+
+    if (!queueExpanded) return;  // collapsed: head line only
+
+    const list = document.createElement("div");
+    list.className = "qt-list";
+    q.forEach((entry, i) => list.appendChild(queueItemRow(sid, entry, i)));
+    tray.appendChild(list);
+  }
+
+  function queueItemRow(sid, entry, i) {
+    const row = document.createElement("div");
+    row.className = "qt-item" + (queueEditIndex === i ? " qt-editing" : "");
+    const num = document.createElement("span");
+    num.className = "qt-num";
+    num.textContent = i + 1;
+    row.appendChild(num);
+
+    if (queueEditIndex === i) {
+      const ta = document.createElement("textarea");
+      ta.className = "qt-edit";
+      ta.value = entry.text || "";
+      ta.rows = 1;
+      ta.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          saveQueueEdit(sid, i, ta.value);
+        } else if (e.key === "Escape") {
+          queueEditIndex = -1;
+          renderQueueTray(sid);
+        }
+      });
+      row.appendChild(ta);
+      const save = document.createElement("button");
+      save.className = "qt-btn qt-save";
+      save.textContent = "save";
+      save.title = "Save (↵)";
+      save.addEventListener("click", () => saveQueueEdit(sid, i, ta.value));
+      row.appendChild(save);
+      const cancel = document.createElement("button");
+      cancel.className = "qt-btn";
+      cancel.textContent = "cancel";
+      cancel.title = "Cancel (esc)";
+      cancel.addEventListener("click", () => {
+        queueEditIndex = -1;
+        renderQueueTray(sid);
+      });
+      row.appendChild(cancel);
+      requestAnimationFrame(() => {
+        ta.focus();
+        ta.selectionStart = ta.value.length;
+      });
+    } else {
+      const txt = document.createElement("span");
+      txt.className = "qt-text" + (i === 0 ? " qt-next" : "");
+      txt.textContent = entry.text || "(attachment)";
+      txt.title = (entry.text || "") + " — click to edit";
+      txt.addEventListener("click", () => {
+        queueEditIndex = i;
+        renderQueueTray(sid);
+      });
+      row.appendChild(txt);
+      if (i === 0) {
+        const hint = document.createElement("span");
+        hint.className = "qt-hint";
+        hint.textContent = "runs next";
+        row.appendChild(hint);
+      }
+      const edit = document.createElement("button");
+      edit.className = "qt-btn";
+      edit.textContent = "✎";
+      edit.title = "Edit this queued message";
+      edit.addEventListener("click", () => {
+        queueEditIndex = i;
+        renderQueueTray(sid);
+      });
+      row.appendChild(edit);
+    }
+
+    const x = document.createElement("button");
+    x.className = "qt-btn qt-x";
+    x.textContent = "✕";
+    x.title = "Cancel this queued message";
+    x.addEventListener("click", () => cancelQueued(sid, i));
+    row.appendChild(x);
+    return row;
+  }
+
+  function saveQueueEdit(sid, i, text) {
+    const clean = (text || "").trim();
+    queueEditIndex = -1;
+    if (!clean) { renderQueueTray(sid); return; }  // empty → keep old text
+    const q = state.queues[sid] || [];
+    if (!q[i]) { renderQueueTray(sid); return; }
+    q[i].text = clean;  // optimistic — the sync below settles it
+    renderQueueTray(sid);
+    api("/api/sessions/" + encodeURIComponent(sid) + "/queue/update", {
+      method: "POST", body: JSON.stringify({ index: i, text: clean }),
+    }).then((res) => res.json().catch(() => ({}))).then((body) => {
+      if (body && body.drained) {
+        // the item ran between load and save — the OLD text went out;
+        // offer the edit back as a composer draft so nothing is lost
+        el.input.value = clean;
+        autosize();
+        const note = document.createElement("div");
+        note.className = "msg-error";
+        note.textContent = "That queued message already started running — " +
+          "your edit is back in the composer.";
+        el.messages.appendChild(note);
+        scrollToBottom(true);
+      }
+      syncQueueFromServer(sid);
+    }).catch(() => syncQueueFromServer(sid));
+  }
+
+  function cancelQueued(sid, i) {
+    const q = state.queues[sid] || [];
+    if (i < 0 || i >= q.length) return;
     q.splice(i, 1);
-    if (turn.root) turn.root.remove();
-    renderQueueChip(sid);
+    if (queueEditIndex === i) queueEditIndex = -1;
+    else if (queueEditIndex > i) queueEditIndex--;  // edit slid down one slot
+    renderQueueTray(sid);
     // server-side drop (the server's queue is authoritative — re-sync after)
     api("/api/sessions/" + encodeURIComponent(sid) + "/queue/remove", {
       method: "POST", body: JSON.stringify({ index: i }),
+    }).then(() => syncQueueFromServer(sid)).catch(() => {});
+  }
+
+  function clearQueueAll(sid) {
+    const q = state.queues[sid] || [];
+    if (!q.length) return;
+    state.queues[sid] = [];
+    queueEditIndex = -1;
+    renderQueueTray(sid);
+    api("/api/sessions/" + encodeURIComponent(sid) + "/queue/clear", {
+      method: "POST",
     }).then(() => syncQueueFromServer(sid)).catch(() => {});
   }
 
@@ -3818,49 +4012,40 @@
       const data = await (await api(
         "/api/sessions/" + encodeURIComponent(sid) + "/queue")).json();
       const server = data.queued || [];
-      const q = state.queues[sid] = state.queues[sid] || [];
-      // merge: local entries hold the _turn refs (cancel ✕ mapping), the
-      // server holds the real text/files — fill in, then trim the tail
-      while (q.length < server.length) q.push({ text: "", files: [] });
-      while (q.length > server.length) {
-        const e = q.pop();
-        if (e._turn && e._turn.root && e._turn.root.isConnected)
-          e._turn.root.remove();
-      }
-      server.forEach((se, i) => {
-        const le = q[i];
-        if (!le) return;
-        if (!le.text && se.text) le.text = se.text;
-        if ((!le.files || !le.files.length) && se.files && se.files.length)
-          le.files = se.files;
-      });
-      if (sid === state.sessionId) renderQueueChip(sid);
-    } catch (e) { /* offline — the queue chip is cosmetic, the server is authoritative */ }
+      // Full rebuild, not a merge: the tray has no per-entry DOM refs to
+      // preserve (rows are rebuilt every render), and a rebuild is what
+      // makes reload-proofness free — the server's list IS the view.
+      state.queues[sid] = server.map((se) => ({
+        text: se.text || "", files: se.files || [],
+      }));
+      // an edit that no longer maps to a slot (item drained/removed) dies
+      if (queueEditIndex >= state.queues[sid].length) queueEditIndex = -1;
+      if (sid === state.sessionId) renderQueueTray(sid);
+    } catch (e) { /* offline — the tray is cosmetic, the server is authoritative */ }
   }
 
   // Called from every terminal settle (done / stopped / error) + on stream
   // settle. The SERVER is the queue driver — it auto-drains the moment a
   // run fully ends (so queued messages run even if this tab is closed).
-  // Here we only prepare the UI: pop the local entry, drop its placeholder,
-  // and hold the stop face up (v.draining) until the next run's `status`
-  // event arrives on the same stream — THAT is what creates the real turn.
+  // Here we only PREPARE the UI: peek the head (pinned-job text for the
+  // handoff strip) and hold the stop face up (v.draining) until the next
+  // run's `status` event arrives on the same stream — THAT is what creates
+  // the real turn. We deliberately do NOT pop the local entry: the server
+  // pops in its own finally (after our `done` frame) and announces it on
+  // the `queued` channel — THAT is what drops the tray row. Popping
+  // optimistically here made the tray vanish a beat before the server
+  // drained (and, once the queue hit 0, hide it entirely until the next
+  // sync — the "rack disappears until reload" bug).
   function drainQueue(sid) {
     if (sid !== state.sessionId) return;  // background chats: the server
-                                           // drains on its own; the chip
+                                           // drains on its own; the tray
                                            // resyncs via loadHistory/refresh
-    const q = state.queues[sid] || [];
-    const entry = q.shift();
-    if (!entry) {
-      // client queue empty — trust the server (another tab may have queued)
-      syncQueueFromServer(sid);
-      return;
-    }
+    const entry = (state.queues[sid] || [])[0];
+    if (!entry) return;  // nothing local — the delayed resync asks the server
     const v = view(sid);
     v.draining = true;  // keep the stop face up across the run handoff
     v._nextJob = entry.text || "(attachment)";  // pinned-job text for the new run
-    if (entry._turn && entry._turn.root && entry._turn.root.isConnected)
-      entry._turn.root.remove();  // placeholder → the real turn (on status)
-    renderQueueChip(sid);
+    renderQueueTray(sid);  // row STAYS; the drain-announce drops it live
   }
 
   // The actual dispatch — the user bubble is added by the caller (send()
@@ -3979,11 +4164,11 @@
   }
 
   function renderComposerStatus() {
-    // the status row hosts the resume/abandon chips + the queue chip — the
+    // the status row hosts the resume/abandon chips + the queue tray — the
     // Plan/Act toggle itself shows the active mode (accent color), no
     // separate chip
     el.composerStatus.hidden = el.resumeChip.hidden && el.abandonChip.hidden
-      && el.queueChip.hidden;
+      && el.queueTray.hidden;
   }
 
   function updateResumeChip(show) {

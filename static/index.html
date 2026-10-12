@@ -14,7 +14,7 @@
   <link rel="stylesheet" href="/static/vendor/hljs-github.min.css" media="(prefers-color-scheme: light)" id="hljs-light"/>
   <link rel="stylesheet" href="/static/vendor/hljs-github-dark.min.css" media="(prefers-color-scheme: dark)" id="hljs-dark"/>
   <link rel="stylesheet" href="/static/vendor/katex.min.css"/>
-  <link rel="stylesheet" href="/static/style.css?v=171"/>
+  <link rel="stylesheet" href="/static/style.css?v=172"/>
 </head>
 <body>
 <!-- Icon sprite (2026-10-05): one stroke family for the whole UI — Lucide-style
@@ -272,7 +272,13 @@
           <div class="composer-status" id="composer-status" hidden>
             <button class="status-chip resume-chip" id="resume-chip" title="The last message has no reply — continue where the run stopped">↻ Resume</button>
             <button class="status-chip abandon-chip" id="abandon-chip" title="Drop the unfinished task and move on — the chat stays, the run is forgotten">✕ Start fresh</button>
-            <span class="status-chip queue-chip" id="queue-chip" title="Messages waiting for the current run to finish — they run in order" hidden></span>
+          <!-- Queue tray (2026-10-12, port of muji f5100c4): the composer's
+               view of the send pipeline — the old queue chip + transcript
+               placeholders, unified. Rendered from the server's /queue
+               endpoint, so the ✎/✕/clear-all controls survive a tab reload
+               by construction (the old transcript placeholders were
+               in-memory and died on reload). -->
+          <div class="queue-tray" id="queue-tray" hidden></div>
           </div>
           <div class="input-wrap">
             <textarea id="input" class="input" rows="1" placeholder="Message muji…"></textarea>
@@ -472,6 +478,6 @@
 <script src="/static/vendor/purify.min.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
 <script src="/static/vendor/katex.min.js"></script>
-<script src="/static/app.js?v=189"></script>
+<script src="/static/app.js?v=190"></script>
 </body>
 </html>

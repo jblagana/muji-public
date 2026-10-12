@@ -1861,7 +1861,67 @@ body[data-mode="act"] .input:focus { border-color: var(--act-toggle); box-shadow
   transition: filter .12s ease;
 }
 .abandon-chip:hover { filter: brightness(1.06); background: var(--panel); }
-.queue-chip { color: var(--accent); border-color: var(--accent); }
+/* Queue tray: the composer's view of the send pipeline (the old queue chip
+   + transcript placeholders, unified). Rendered from the server's /queue
+   endpoint, so ✎/✕/clear-all survive a tab reload by construction. */
+.queue-tray {
+  border: 1px solid var(--accent);
+  background: var(--panel-2);
+  border-radius: 10px;
+  margin: 0 0 8px;
+  padding: 7px 10px;
+  font-size: 12.5px;
+}
+.queue-tray[hidden] { display: none; }
+.qt-head {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--accent); font-weight: 600; font-size: 12px;
+}
+.qt-head.qt-foldable { cursor: pointer; }
+.qt-head.qt-foldable:hover .qt-arrow { color: var(--text); }
+.qt-arrow { flex: none; font-size: 10px; color: var(--muted); }
+.qt-count {
+  flex: 1;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.qt-clear {
+  border: 1px solid var(--border); border-radius: 6px; background: var(--panel);
+  color: var(--muted); cursor: pointer; font-size: 11px; padding: 2px 8px;
+}
+.qt-clear:hover { color: var(--err); border-color: var(--err); }
+.qt-list { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+.qt-item {
+  display: flex; align-items: flex-start; gap: 7px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel); padding: 5px 8px;
+}
+.qt-item.qt-editing { border-color: var(--accent); }
+.qt-num {
+  color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums;
+  min-width: 12px; text-align: right; padding-top: 2px;
+}
+.qt-text {
+  flex: 1; color: var(--text); cursor: text;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.qt-text.qt-next { font-weight: 600; }
+.qt-hint {
+  color: var(--accent); font-size: 10.5px; padding-top: 2px;
+  border: 1px solid var(--accent); border-radius: 999px; padding: 1px 7px;
+}
+.qt-edit {
+  flex: 1; resize: none; border: 1px solid var(--accent); border-radius: 6px;
+  background: var(--panel-2); color: var(--text); font: inherit;
+  padding: 3px 7px; min-height: 26px;
+}
+.qt-btn {
+  border: 1px solid var(--border); border-radius: 6px; background: var(--panel-2);
+  color: var(--muted); cursor: pointer; font-size: 11px; line-height: 1;
+  padding: 3px 7px; white-space: nowrap;
+}
+.qt-btn:hover { color: var(--text); border-color: var(--muted); }
+.qt-btn.qt-save { color: var(--ok); border-color: var(--ok); }
+.qt-btn.qt-x:hover { color: var(--err); border-color: var(--err); }
 .status-chip[hidden] { display: none; }  /* display:inline-flex would beat [hidden] */
 /* queued-message cancel: a small ✕ that sits on the "⏳ Queued" chip row */
 .queued-cancel {

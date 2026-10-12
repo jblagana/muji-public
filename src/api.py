@@ -1265,6 +1265,34 @@ async def api_session_queue_remove(sid: str, body: dict):
     return {"ok": True, "queued": tasks.queue_count(sid)}
 
 
+@app.post("/api/sessions/{sid}/queue/update")
+async def api_session_queue_update(sid: str, body: dict):
+    """Edit one queued message by position (the tray's ✎ inline box).
+    The message hasn't run yet, so the edit is safe — the drain pops by
+    position. If the index is already gone (the item drained between
+    load and save), return `drained` so the client can offer the text
+    back as a composer draft instead of silently losing the edit."""
+    if not db.get_session(sid):
+        raise HTTPException(404, "unknown session")
+    index = int(body.get("index") or 0)
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "no text to save")
+    if tasks.queue_update(sid, index, text):
+        return {"ok": True, "queued": tasks.queue_count(sid)}
+    return {"ok": False, "drained": True}
+
+
+@app.post("/api/sessions/{sid}/queue/clear")
+async def api_session_queue_clear(sid: str):
+    """Drop EVERY queued message for this session (the tray's
+    "clear all"). Idempotent — an empty queue is a no-op."""
+    if not db.get_session(sid):
+        raise HTTPException(404, "unknown session")
+    n = tasks.queue_clear(sid)
+    return {"ok": True, "cleared": n, "queued": tasks.queue_count(sid)}
+
+
 @app.post("/api/chat/stop")
 async def api_chat_stop(body: dict):
     sid = body.get("session_id", "")

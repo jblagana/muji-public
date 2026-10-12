@@ -44,6 +44,12 @@ class TaskRun:
         self.sid = sid
         self.task_id = uuid.uuid4().hex
         self.status = "queued"      # queued | running | done | error | stopped
+        #: WHY a stopped run stopped — the `stopped` frame's reason. The
+        #: queue drain only suppresses on "stopped by user" (a hard stop
+        #: means the user's queued follow-ups don't auto-fire); system
+        #: stops (empty answer, max turns) drain normally so their
+        #: auto-resume nudge can launch.
+        self.stop_reason: str | None = None
         self.seq = seq
         #: seq value at the moment this run begins — the events-log replay for an
         #: in-flight turn starts here, isolating THIS run's structural events from
@@ -226,6 +232,41 @@ class TaskManager:
             self._push(run, "queued", {"queued": 0})
         return True
 
+    def queue_update(self, sid: str, index: int, text: str) -> bool:
+        """Edit the queued message at `index` (it hasn't run yet — the
+        drain pops by position, so the edit applies under the same
+        single-threaded loop the drain runs in). Returns False when the
+        index is gone — the item already drained and started running, in
+        which case the caller offers the text back as a composer draft.
+        """
+        text = (text or "").strip()
+        if not text:
+            return False
+        q = self.queues.get(sid)
+        if not q or not (0 <= index < len(q)):
+            return False
+        q[index]["message"] = text
+        self._sync_queue_rows(sid)
+        run = self.runs.get(sid)
+        if run is not None and run.active:
+            self._push(run, "queued", {"queued": len(q)})
+        return True
+
+    def queue_clear(self, sid: str) -> int:
+        """Drop EVERY queued message for this session (the tray's
+        "clear all"). Returns how many were removed."""
+        q = self.queues.get(sid)
+        if not q:
+            return 0
+        n = len(q)
+        q.clear()
+        self.queues.pop(sid, None)
+        self._sync_queue_rows(sid)
+        run = self.runs.get(sid)
+        if run is not None and run.active:
+            self._push(run, "queued", {"queued": 0})
+        return n
+
     def enqueue(self, sid: str, message: str, files: list[dict],
                 mode: str = "act", roast: str = "chill",
                 resume: bool = False) -> tuple[TaskRun, bool]:
@@ -390,10 +431,18 @@ class TaskManager:
                         except json.JSONDecodeError:
                             data = {}
                     last_name = self._push(run, name, data)
+                    if name == "stopped":
+                        # capture the WHY — the drain below only suppresses
+                        # on a USER stop; an empty-answer / max-turns stop
+                        # must drain so its auto-resume nudge can launch
+                        run.stop_reason = str(data.get("reason") or "")
                 run.status = {"stopped": "stopped",
                               "error": "error"}.get(last_name, "done")
         except asyncio.CancelledError:
             run.status = "stopped"
+            # a hard stop is a USER stop, whatever the stream last said —
+            # the drain must suppress queued follow-ups for it
+            run.stop_reason = "stopped by user"
             if last_name not in ("done", "error", "stopped"):
                 # the cancel landed OUTSIDE the generator (e.g. the turn was
                 # still queued for an agent slot) — the stream still needs a
@@ -469,11 +518,33 @@ class TaskManager:
                     # (seq > old), not miss them all
                     nrun = TaskRun(sid, seq=run.seq)
                     self.runs[sid] = nrun
+                    # The task is created BEFORE the drain-announcement push
+                    # so the pump's first step (status=running) lands in the
+                    # same scheduling slot as before — the drain-resume test
+                    # polls early and a push between create_task and the
+                    # pump's first await would defer the start by one
+                    # microtask (the drain would look "not started").
                     nrun._task = asyncio.create_task(
                         self._pump(nrun, nxt["message"], nxt.get("files") or [],
                                    nxt.get("mode") or "act",
                                    nxt.get("roast") or "chill",
                                    bool(nxt.get("resume"))))
+                    # Drain-announce: the head just left the queue — tell
+                    # every open tab so the tray drops the row live (the
+                    # client's local pop can race this server-side pop:
+                    # items queued from another tab, a reload mid-run, the
+                    # empty-local sync hitting the pre-drain list). Without
+                    # this event the tray keeps the dead row until a reload.
+                    # Pushed on nrun: the old run's stream is closed by the
+                    # sentinel, so the NEW run's buffer is what replays to
+                    # the reconnecting client.
+                    # Carries the fired text too: the client draws the
+                    # fired message's user bubble at the handoff, and this
+                    # event is the AUTHORITATIVE source for that text —
+                    # the client's local peek (v._nextJob / state.queues)
+                    # is empty when the item was queued from another tab.
+                    self._push(nrun, "queued",
+                               {"queued": len(q), "fired": nxt["message"]})
 
     async def events(self, sid: str, after: int = 0):
         """Yield SSE frames for one session: buffered replay, then live.

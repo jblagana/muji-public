@@ -722,6 +722,69 @@ check("drain cleared the queue + checkpoint",
       tmq4.queue_count(sidq3) == 0 and db.queue_load(sidq3) == [])
 db.clear_run_state(sidq3)
 
+# Drain-announce: when the head leaves the queue, the NEW run's buffer
+# must carry a `queued` event with the fired text — the tray drops its
+# row live and draws the fired message's user bubble from this (the
+# authoritative source: items queued from another tab have no local
+# peek). This test fails if the push is missing (it was once a comment
+# describing a push that didn't exist — the "tray stuck until reload"
+# bug).
+sidq4 = "q-drain-announce"
+
+async def _drive_q4():
+    tmq5 = tasks_mod.TaskManager(lambda *a: None)
+    async def _spy_q4(sid, message, files, log, mode, roast, resume):
+        yield 'event: done\ndata: {"text": "ok"}\n\n'
+    agent_mod.run_chat = _spy_q4
+    tmq5.enqueue(sidq4, "qa-first", [], "act", "chill", False)
+    tmq5.enqueue(sidq4, "qa-fired", [], "act", "chill", False)
+    for _ in range(1600):
+        if not tmq5.queue_count(sidq4) and \
+           (tmq5.get(sidq4) is None or not tmq5.get(sidq4).active):
+            break
+        await asyncio.sleep(0.005)
+    # the drain-announce rides the NEW run's buffer (the old run's stream
+    # is closed by the sentinel) — grab the current run, not the first
+    return tmq5.get(sidq4)
+
+nrun4 = asyncio.run(_drive_q4())
+agent_mod.run_chat = _stub_run_chat  # restore
+ann = [f for _, f in (nrun4.buffer if nrun4 is not None else [])
+       if f.startswith("event: queued") and '"fired"' in f]
+check("drain announces the pop on the new run's buffer (fired text)",
+      bool(ann) and '"fired": "qa-fired"' in ann[-1],
+      ann[-1].replace("\n", " | ") if ann else "no drain-announce frame")
+
+# queue_update / queue_clear: the tray's ✎ (edit) and "clear all"
+sidq5 = "q-tray-mutations"
+
+async def _drive_q5():
+    tmq6 = tasks_mod.TaskManager(lambda *a: None)
+    async def _spy_q5(sid, message, files, log, mode, roast, resume):
+        if message == "qt-first":
+            await asyncio.sleep(0.3)
+        yield 'event: done\ndata: {"text": "ok"}\n\n'
+    agent_mod.run_chat = _spy_q5
+    tmq6.enqueue(sidq5, "qt-first", [], "act", "chill", False)
+    await asyncio.sleep(0.05)
+    tmq6.enqueue(sidq5, "qt-edit-me", [], "act", "chill", False)
+    tmq6.enqueue(sidq5, "qt-drop-me", [], "act", "chill", False)
+    assert tmq6.queue_count(sidq5) == 2
+    ok = tmq6.queue_update(sidq5, 0, "qt-edited")
+    got = [e["message"] for e in tmq6.queues.get(sidq5, ())]
+    gone = tmq6.queue_update(sidq5, 99, "nope")
+    n = tmq6.queue_clear(sidq5)
+    return ok, got, gone, n, tmq6.queue_count(sidq5), tmq6
+
+ok5, got5, gone5, n5, cnt5, tmq6 = asyncio.run(_drive_q5())
+agent_mod.run_chat = _stub_run_chat  # restore
+check("queue_update edits by position (durable mirror re-synced)",
+      ok5 and got5 == ["qt-edited", "qt-drop-me"], str(got5))
+check("queue_update on a gone index returns False (drain race → draft)",
+      gone5 is False)
+check("queue_clear drops everything (idempotent, count 0 after)",
+      n5 == 2 and cnt5 == 0 and tmq6.queue_clear(sidq5) == 0)
+
 print("── 8. reattach snapshot: in-flight draft row ────────────────────")
 # Regression: leaving a chat mid-turn and returning lost everything that
 # happened while away — the draft row held the turn timeline but

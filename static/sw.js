@@ -1,5 +1,5 @@
 /* muji service worker — v40 (network-first shell; cache-first static; self-updating) */
-const CACHE = "muji-v118";
+const CACHE = "muji-v119";
 const SHELL = [
   "/",
   "/static/index.html",
