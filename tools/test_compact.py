@@ -175,10 +175,16 @@ def test_compact_prompt_preserves_workarounds():
 
 
 def test_settings():
+    import os
     assert settings.compact_enabled is True
-    assert settings.compact_trigger == 220000
-    assert settings.compact_context_limit == 265000
-    assert settings.compact_recent == 4
+    # The ambient environment can override the config defaults (running from
+    # a shell that inherited ANOTHER muji's env), so compare against what
+    # config actually reads — not a hardcoded number.
+    assert settings.compact_trigger == int(
+        os.environ.get("COMPACT_TRIGGER", "220000"))
+    assert settings.compact_context_limit == int(
+        os.environ.get("COMPACT_CONTEXT_LIMIT", "265000"))
+    assert settings.compact_recent == int(os.environ.get("COMPACT_RECENT", "4"))
     print("settings ok")
 
 

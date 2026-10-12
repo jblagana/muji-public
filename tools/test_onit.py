@@ -785,6 +785,82 @@ check("queue_update on a gone index returns False (drain race → draft)",
 check("queue_clear drops everything (idempotent, count 0 after)",
       n5 == 2 and cnt5 == 0 and tmq6.queue_clear(sidq5) == 0)
 
+# ── 7e. drain suppression is REASON-specific, not status-specific ──
+# Muji 10-04 incident: empty answer → `stopped` frame → auto-resume
+# enqueued the nudge 6 ms later (resume=1) → the drain's blanket
+# `status != "stopped"` skip (meant only for USER hard-stops) ate the
+# nudge; it rotted in the queue until the next restart. Now the drain
+# suppresses ONLY on stop_reason == "stopped by user".
+sidq4 = "q-drain-reason-system"
+calls4: list = []
+
+async def _drive_q4():
+    tmq5 = tasks_mod.TaskManager(lambda *a: None)
+    async def _spy_q4(sid, message, files, log, mode, roast, resume):
+        calls4.append((message, resume))
+        if message == "q4-first":
+            # empty-answer stop: resumable system stop, reason is NOT
+            # "stopped by user"
+            db.save_run_state(sid, 2, ["a"], {0},
+                              [{"role": "user", "content": "q4-first"}],
+                              "q4-first")
+            yield ('event: stopped\n'
+                   'data: {"reason": "model returned an empty answer"}\n\n')
+            # auto-resume enqueues the nudge right after the frame
+            tmq5.enqueue(sid, "q4-auto-nudge", [], "act", "chill", True)
+        else:
+            yield 'event: done\ndata: {"text": "ok"}\n\n'
+    agent_mod.run_chat = _spy_q4
+    tmq5.enqueue(sidq4, "q4-first", [], "act", "chill", False)
+    for _ in range(1600):
+        if not tmq5.queue_count(sidq4) and \
+           (tmq5.get(sidq4) is None or not tmq5.get(sidq4).active):
+            break
+        await asyncio.sleep(0.005)
+    return tmq5
+
+tmq5 = asyncio.run(_drive_q4())
+check("system stop (empty answer): drain fires the auto-resume nudge",
+      len(calls4) == 2 and calls4[1] == ("q4-auto-nudge", True),
+      str(calls4))
+check("system stop: queue + checkpoint drained",
+      tmq5.queue_count(sidq4) == 0 and db.queue_load(sidq4) == [])
+db.clear_run_state(sidq4)
+
+sidq5 = "q-drain-reason-user"
+calls5: list = []
+
+async def _drive_q5():
+    tmq6 = tasks_mod.TaskManager(lambda *a: None)
+    async def _spy_q5(sid, message, files, log, mode, roast, resume):
+        calls5.append((message, resume))
+        if message == "q5-first":
+            yield 'event: status\ndata: {"text": "Working\u2026"}\n\n'
+            await asyncio.sleep(0.4)  # still in flight when the user stops
+        yield 'event: done\ndata: {"text": "ok"}\n\n'
+    agent_mod.run_chat = _spy_q5
+    tmq6.enqueue(sidq5, "q5-first", [], "act", "chill", False)
+    await asyncio.sleep(0.1)
+    tmq6.enqueue(sidq5, "q5-queued-followup", [], "act", "chill", False)
+    tmq6.cancel(sidq5)  # the user's hard stop
+    for _ in range(1600):
+        if not tmq6.queue_count(sidq5) and \
+           (tmq6.get(sidq5) is None or not tmq6.get(sidq5).active):
+            break
+        await asyncio.sleep(0.005)
+    return tmq6
+
+tmq6 = asyncio.run(_drive_q5())
+check("user hard stop: queued follow-up stays parked (drain suppressed)",
+      len(calls5) == 1 and tmq6.queue_count(sidq5) == 1
+      and db.queue_load(sidq5) != [], str(calls5))
+check("user hard stop: the run reports the user reason",
+      tmq6.get(sidq5) is not None
+      and tmq6.get(sidq5).stop_reason == "stopped by user",
+      str(tmq6.get(sidq5).stop_reason if tmq6.get(sidq5) else None))
+tmq6.queue_clear(sidq5)
+agent_mod.run_chat = _stub_run_chat  # restore (later sections rely on it)
+
 print("── 8. reattach snapshot: in-flight draft row ────────────────────")
 # Regression: leaving a chat mid-turn and returning lost everything that
 # happened while away — the draft row held the turn timeline but

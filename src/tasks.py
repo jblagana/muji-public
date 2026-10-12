@@ -471,11 +471,17 @@ class TaskManager:
             clear_stopper(sid)
             # Queue drain: the run above is FULLY done (its finally already
             # cleared the DB processing flag), so the next queued message can
-            # start without a busy-flag race. Skipped when the run was
-            # hard-cancelled — the user stopped the turn, so its queued
-            # follow-ups don't auto-fire (the client re-sends them if the
-            # user wants).
-            if run.status != "stopped":
+            # start without a busy-flag race. Skipped ONLY when the user
+            # hard-stopped the turn — the user's queued follow-ups don't
+            # auto-fire after a deliberate stop (the client re-sends them if
+            # the user wants). System stops (empty answer, max turns) drain
+            # normally: their auto-resume nudge is enqueued right after the
+            # `stopped` frame and must launch in-process, not rot in the
+            # queue until the next restart (the Muji 10-04 incident: the
+            # nudge was enqueued 6 ms after the empty-answer stop, then the
+            # old blanket `status != "stopped"` skip ate it).
+            if not (run.status == "stopped"
+                    and run.stop_reason == "stopped by user"):
                 q = self.queues.get(sid)
                 if q:
                     cur = self.runs.get(sid)
