@@ -138,15 +138,43 @@ class Settings:
         # 0 = unlimited: context compaction (COMPACT_TRIGGER) is the pacing
         # mechanism, not a turn budget. Set >0 for a hard safety cap.
         self.max_turns = int(os.environ.get("MAX_TURNS", "0"))
-        # Context compaction: summarize older messages once the estimated
-        # context reaches COMPACT_TRIGGER (tokens). Model limit (Qwen via
-        # vLLM) is 265k; trigger sits at ~83% of it (Cline's ratio) so there
-        # is headroom for the summary call itself, the next user message and
-        # the next tool output.
+        # Per-ROUND completion cap (thinking + answer tokens), 2026-10-08:
+        # the AI Classes run burned ~72 min on ONE round — 497 KB of
+        # degenerated thinking — because the request carried no max_tokens
+        # and the server ran to its own (huge) limit. 32k is the backstop:
+        # a healthy round on this workload peaks well below it, and a loop
+        # that trips the thinking tripwire dies at ~4 KB anyway; this cap
+        # is what bounds a round the tripwire MISSES. 0 = unlimited.
+        self.max_tokens = int(os.environ.get("MAX_TOKENS", "32768"))
+        # Context compaction (boss design 2026-10-11):
+        #   COMPACT_BOUNDARY  = the context meter's 100% mark — the model's
+        #                       real limit (Qwen via vLLM: 265k), so the
+        #                       topbar shows distance to the wall.
+        #   COMPACT_TRIGGER   = where the LOSSY summary pass fires: at turn
+        #                       boundaries (rebuild) when context >= trigger.
+        #                       Mid-turn, old tool results used to be
+        #                       cleared (lossless) per round — now OFF by
+        #                       default (COMPACT_MID_TURN_CLEAR), so a turn
+        #                       runs on full recall until the boundary pass.
         self.compact_enabled = os.environ.get("COMPACT_ENABLED", "1") == "1"
+        # PERSISTED COMPACTION (boss-approved 2026-10-09, replaces the
+        # CONTEXT_WINDOW experiment): the per-turn rebuild loads the
+        # session's FULL history (plus the persisted summary of everything
+        # older than the marker) — no fixed 16-row tail, no token-budget
+        # window. The lossy pass fires at turn boundaries (trigger); the
+        # result is persisted on the session
+        # (compacted_summary + compacted_through_msg_id) so it runs once
+        # per growth, not per turn.
+        self.compact_boundary = int(os.environ.get("COMPACT_BOUNDARY", "256000"))
         self.compact_context_limit = int(os.environ.get("COMPACT_CONTEXT_LIMIT", "265000"))
-        self.compact_trigger = int(os.environ.get("COMPACT_TRIGGER", "220000"))
+        self.compact_trigger = int(os.environ.get("COMPACT_TRIGGER", "100000"))
         self.compact_recent = int(os.environ.get("COMPACT_RECENT", "4"))
+        # MID-TURN LOSSLESS CLEAR (boss-disabled 2026-10-12): the per-round
+        # tool-result stubbing that ran every round once context crossed the
+        # trigger. Off by default — a turn now runs on full recall until the
+        # turn BOUNDARY compaction (clear + LLM summary) fires; the overflow
+        # recovery's aggressive clear is untouched and remains the backstop.
+        self.compact_mid_turn_clear = os.environ.get("COMPACT_MID_TURN_CLEAR", "0") == "1"
         self.command_timeout = int(os.environ.get("COMMAND_TIMEOUT", "120"))
         self.approval_timeout = int(os.environ.get("APPROVAL_TIMEOUT", "180"))
         self.question_timeout = int(os.environ.get("QUESTION_TIMEOUT", "180"))

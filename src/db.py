@@ -314,6 +314,23 @@ def _db() -> sqlite3.Connection:
             _conn.commit()
         except sqlite3.OperationalError:
             pass
+        try:
+            # persisted compaction (2026-10-09): the LLM summary of all
+            # messages OLDER than compacted_through_msg_id. The rebuild
+            # loads [summary] + rows after the marker instead of re-running
+            # the lossy summary every turn (compaction is the SOLE memory
+            # manager — no fixed-row tail, no token-budget window).
+            _conn.execute(
+                "ALTER TABLE sessions ADD COLUMN compacted_summary TEXT")
+            _conn.commit()
+        except sqlite3.OperationalError:
+            pass
+        try:
+            _conn.execute(
+                "ALTER TABLE sessions ADD COLUMN compacted_through_msg_id INTEGER")
+            _conn.commit()
+        except sqlite3.OperationalError:
+            pass
     return _conn
 
 
@@ -413,6 +430,22 @@ def set_ctx_tokens(sid: str, n: int | None) -> None:
     with _lock:
         _db().execute("UPDATE sessions SET ctx_tokens=? WHERE id=?",
                       (n, sid))
+        _db().commit()
+
+
+def set_compaction(sid: str, summary: str, through_msg_id: int) -> None:
+    """Persist a compaction: everything in this session's message history
+    OLDER than `through_msg_id` is represented by `summary` in the model's
+    context. The rebuild loads [summary] + rows after the marker — the
+    lossy summary runs once per growth past the trigger, not per turn.
+    Rows themselves are never touched (search_transcript recall is intact)."""
+    if not sid:
+        return
+    with _lock:
+        _db().execute(
+            "UPDATE sessions SET compacted_summary=?, "
+            "compacted_through_msg_id=? WHERE id=?",
+            (summary, through_msg_id, sid))
         _db().commit()
 
 

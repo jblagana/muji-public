@@ -377,8 +377,11 @@ async def api_config():
         "model": settings.model, "root_dir": str(settings.root_dir),
         "fact_check": settings.fact_check, "auth_enabled": False,
         "tz_offset": settings.tz_offset,
-        # context meter: the pill's denominator is the compaction trigger
+        # context meter: denominator = the model's real limit (boundary,
+        # the 100% mark); the sublabel shows where compaction actually
+        # fires (trigger, at turn boundaries)
         "compact_trigger": settings.compact_trigger,
+        "compact_boundary": settings.compact_boundary,
         "compact_enabled": settings.compact_enabled,
     }
 

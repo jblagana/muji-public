@@ -85,6 +85,23 @@ class LLM:
     def native_tools_enabled(self) -> bool:
         return self.mode in ("native", "auto")
 
+    def stream_kwargs(self, messages: list[dict], temperature: float) -> dict:
+        """Base kwargs for a STREAMING completion (extracted so tests can
+        assert on the request shape). Carries the per-round completion
+        cap (2026-10-08): the hard backstop for a degeneration the
+        thinking tripwire misses — without it the server ran a looping
+        round to its own limit (72 min, 497 KB, AI Classes)."""
+        kwargs = dict(
+            model=settings.model,
+            messages=messages,
+            stream=True,
+            stream_options={"include_usage": True},  # final-chunk usage → tok/s
+            temperature=temperature,
+        )
+        if settings.max_tokens > 0:
+            kwargs["max_tokens"] = settings.max_tokens
+        return kwargs
+
     async def stream(self, messages: list[dict], tools: list[dict] | None = None,
                      thinking: str | None = None):
         """Yield event dicts:
@@ -99,13 +116,7 @@ class LLM:
         THINKING_LOOP for tool-loop rounds; None → settings.thinking."""
         if not settings.model:
             raise LLMError("MODEL is not set — edit .env")
-        kwargs = dict(
-            model=settings.model,
-            messages=messages,
-            stream=True,
-            stream_options={"include_usage": True},  # final-chunk usage → tok/s
-            temperature=settings.temperature,
-        )
+        kwargs = self.stream_kwargs(messages, settings.temperature)
         # thinking control: this endpoint (vLLM Qwen3) honours
         # reasoning_effort {low|medium|xhigh} and chat_template_kwargs —
         # probed live with tools/probe_thinking.py. Per-call override

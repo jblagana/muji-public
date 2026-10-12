@@ -95,6 +95,38 @@ def _tool_msgs(n_old=6, recent=4):
     return msgs
 
 
+def test_ctx_tokens_floor():
+    """Turn-boundary compaction must use max(est_tokens, sessions.ctx_tokens)
+    as its trigger input (2026-10-12, TA-session bug): est_tokens is a char/4
+    estimate that undercounts the real provider count by ~10k (tool schemas +
+    API overhead), so a session running at 107k REAL tokens can estimate
+    under the 100k trigger and never compact. The previous turn's llm_end
+    already persists the real count to sessions.ctx_tokens — use it as a
+    floor so the LLM summary fires when the provider says so."""
+    import src.agent as agent
+    src = Path(agent.__file__).read_text(encoding="utf-8")
+    # the floor exists and feeds BOTH the outer gate and the post-clear gate
+    assert "real_ctx = int(sess.get(\"ctx_tokens\") or 0)" in src
+    assert "ctx_est = max(est_tokens(messages), real_ctx)" in src
+    assert "and ctx_est >= settings.compact_trigger" in src
+    assert src.count("max(est_tokens(messages), real_ctx)") >= 2
+
+    trigger = settings.compact_trigger
+
+    def fires(est: int, real: int) -> bool:
+        return max(est, real) >= trigger
+
+    # the TA-session shape: real 107k, estimate ~95k (under trigger) → fires
+    assert fires(95_000, 107_337) is True
+    # both under → no fire (round 1 / fresh session)
+    assert fires(50_000, 40_000) is False
+    # estimate over, no real read yet (ctx_tokens NULL → 0) → fires (fallback)
+    assert fires(105_000, 0) is True
+    # real under, estimate over → fires (max, not min)
+    assert fires(110_000, 80_000) is True
+    print("ctx_tokens floor ok")
+
+
 def test_clear_stubs_old_only():
     """Old tool results become stubs; the keep-tail is untouched; tool
     CALLS and conversation text survive; the stub keeps the receipt."""
@@ -181,11 +213,43 @@ def test_settings():
     # a shell that inherited ANOTHER muji's env), so compare against what
     # config actually reads — not a hardcoded number.
     assert settings.compact_trigger == int(
-        os.environ.get("COMPACT_TRIGGER", "220000"))
+        os.environ.get("COMPACT_TRIGGER", "100000"))
+    assert settings.compact_boundary == int(
+        os.environ.get("COMPACT_BOUNDARY", "256000"))
+    assert settings.compact_trigger < settings.compact_boundary
     assert settings.compact_context_limit == int(
         os.environ.get("COMPACT_CONTEXT_LIMIT", "265000"))
     assert settings.compact_recent == int(os.environ.get("COMPACT_RECENT", "4"))
+    # mid-turn lossless clear: disabled by default (boss 2026-10-12) unless
+    # the env explicitly turns it back on
+    assert settings.compact_mid_turn_clear == (
+        os.environ.get("COMPACT_MID_TURN_CLEAR", "0") == "1")
     print("settings ok")
+
+
+def test_mid_turn_clear_wiring():
+    """The per-round tool-result stubbing must be gated on
+    COMPACT_MID_TURN_CLEAR (off by default): the mid-turn clear call sits
+    behind the flag, while the overflow recovery's aggressive clear
+    (keep-tail 1) stays ungated — it's the backstop."""
+    import src.agent as agent
+    src = Path(agent.__file__).read_text(encoding="utf-8")
+    # the gate: flag in the mid-turn condition
+    assert "settings.compact_mid_turn_clear" in src
+    gate = src.index("settings.compact_mid_turn_clear")
+    mid = src.index("cleared old tool results mid-turn")
+    assert gate < mid, "flag must gate the mid-turn clear, not follow it"
+    # the mid-turn clear is the only call site gated by the flag
+    assert src.count("settings.compact_mid_turn_clear") == 1
+    # overflow recovery's aggressive clear is untouched (no flag between
+    # the 'Context overflow — recovering' marker and the keep-tail-1 call)
+    rec = src.index("Context overflow — recovering")
+    rec_clear = src.index("_clear_old_tool_results(messages, 1)")
+    assert rec < rec_clear
+    assert "settings.compact_mid_turn_clear" not in src[rec:rec_clear]
+    # default is OFF
+    assert settings.compact_mid_turn_clear is False
+    print("mid-turn clear wiring ok")
 
 
 def test_unlimited_loop_condition():
@@ -336,6 +400,7 @@ def test_recovery_wiring():
 if __name__ == "__main__":
     test_est_tokens()
     test_real_token_trigger()
+    test_ctx_tokens_floor()
     test_clear_stubs_old_only()
     test_clear_keeps_recent_tool_results()
     test_clear_text_mode_tool_result()
@@ -349,4 +414,5 @@ if __name__ == "__main__":
     test_overflow_detection()
     test_hard_truncate()
     test_recovery_wiring()
+    test_mid_turn_clear_wiring()
     print("ALL OK")

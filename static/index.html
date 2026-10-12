@@ -180,13 +180,15 @@
   <!-- Main -->
   <main class="main">
     <header class="topbar">
-      <!-- Context meter: fill of this chat's context vs the compaction
-           trigger. Data: sessions.ctx_tokens (persisted from the model's
-           prompt_tokens each round); live updates ride llm_end/status. -->
+      <!-- Context meter: fill of this chat's context vs the model's real
+           limit (compact_boundary = 100%); sublabel shows the compaction
+           trigger (turn boundaries). Data: sessions.ctx_tokens
+           (persisted from the model's prompt_tokens each round); live
+           updates ride llm_end/status. -->
       <span class="ctx-meter" id="ctx-meter" hidden>
         <span class="ctx-bar"><i id="ctx-fill"></i></span>
         <span class="ctx-pct" id="ctx-pct">0%</span>
-        <span class="ctx-tip"><b id="ctx-num">—</b> tokens<span class="sub" id="ctx-sub">auto-compacts at —</span></span>
+        <span class="ctx-tip"><b id="ctx-num">—</b> tokens<span class="sub" id="ctx-sub">compacts at —</span></span>
       </span>
       <!-- tok/s: the last real decode speed of this chat (each llm_end frame
            carries tok_s, computed server-side). Color dot: green ≥55 /
@@ -251,34 +253,23 @@
         </div>
         <div class="composer" id="composer">
           <div class="attachments" id="attachments"></div>
-          <div class="learn-banner" id="learn-banner" hidden>
-            <div class="learn-head">
-              <span class="learn-ic" title="Learned patterns &#8212; muji's human-gated memory"><span class="mi mi-brain"></span></span>
-              <span class="learn-count" id="learn-count"></span>
-              <button class="mini-btn" id="learn-review-btn" title="Review pending patterns">Review</button>
-              <button class="mini-btn" id="learn-later-btn" title="Hide &#8212; I'll review later">Later</button>
-            </div>
-            <div class="learn-list" id="learn-list" hidden></div>
+          <!-- Review panel: learned patterns / tool quirks — opens on demand
+               from the topbar 🧠/🔧 buttons (the composer banner was retired
+               2026-10-12; new pending entries no longer pop here). -->
+          <div class="learn-panel" id="learn-panel" hidden>
+            <div class="learn-list" id="learn-list"></div>
           </div>
-          <div class="learn-banner" id="wench-banner" hidden>
-            <div class="learn-head">
-              <span class="learn-ic" title="Tool quirks &#8212; verified tool behaviors (tool_notes.md)"><span class="mi mi-wrench"></span></span>
-              <span class="learn-count" id="wench-count"></span>
-              <button class="mini-btn" id="wench-review-btn" title="Review pending quirks">Review</button>
-              <button class="mini-btn" id="wench-later-btn" title="Hide &#8212; I'll review later">Later</button>
-            </div>
-            <div class="learn-list" id="wench-list" hidden></div>
+          <div class="learn-panel" id="wench-panel" hidden>
+            <div class="learn-list" id="wench-list"></div>
           </div>
+          <!-- Queue tray: the composer's view of the send pipeline. Rendered
+               from the server's /queue endpoint (authoritative), so the ✎/✕/
+               clear-all controls survive a tab reload by construction — the
+               old transcript placeholders were in-memory and died on reload. -->
+          <div class="queue-tray" id="queue-tray" hidden></div>
           <div class="composer-status" id="composer-status" hidden>
             <button class="status-chip resume-chip" id="resume-chip" title="The last message has no reply — continue where the run stopped">↻ Resume</button>
             <button class="status-chip abandon-chip" id="abandon-chip" title="Drop the unfinished task and move on — the chat stays, the run is forgotten">✕ Start fresh</button>
-          <!-- Queue tray (2026-10-12, port of muji f5100c4): the composer's
-               view of the send pipeline — the old queue chip + transcript
-               placeholders, unified. Rendered from the server's /queue
-               endpoint, so the ✎/✕/clear-all controls survive a tab reload
-               by construction (the old transcript placeholders were
-               in-memory and died on reload). -->
-          <div class="queue-tray" id="queue-tray" hidden></div>
           </div>
           <div class="input-wrap">
             <textarea id="input" class="input" rows="1" placeholder="Message muji…"></textarea>
@@ -478,6 +469,6 @@
 <script src="/static/vendor/purify.min.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
 <script src="/static/vendor/katex.min.js"></script>
-<script src="/static/app.js?v=190"></script>
+<script src="/static/app.js?v=191"></script>
 </body>
 </html>

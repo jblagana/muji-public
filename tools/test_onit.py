@@ -333,6 +333,89 @@ except tools.ToolError as e:
     _nf_bad = str(e)
 check("note_fact: no session id is a ToolError", "session" in _nf_bad, _nf_bad)
 
+print("── 4d. persisted compaction (sole memory manager) ────────────")
+import asyncio as _asyncio  # noqa: E402
+
+async def _pc_collect(gen):
+    async for _ in gen:
+        pass
+
+# db layer: marker + summary round-trip on the session row
+_pc_sid = db.create_session()["id"]
+db.set_compaction(_pc_sid, "CONTEXT SUMMARY:\ntest", 42)
+_pc_sess = db.get_session(_pc_sid)
+check("set_compaction persists summary + marker on the session",
+      _pc_sess["compacted_summary"].startswith("CONTEXT SUMMARY:")
+      and _pc_sess["compacted_through_msg_id"] == 42)
+
+# agent layer: the rebuild loads FULL history (no 16-row tail, no
+# token-budget window) — a session with 40 messages sees all 39 of them
+# in the first model call
+_pc_sid2 = db.create_session()["id"]
+for i in range(40):
+    db.add_message(_pc_sid2, "user" if i % 2 == 0 else "assistant",
+                   f"message number {i} " + "x" * 200)
+_pc_llm = agent._llm
+class _PCMockLLM:
+    mode = "native"
+    def __init__(self, real):
+        self._real = real
+        self.captured = None
+    async def stream(self, messages, tools=None, thinking=None):
+        self.captured = list(messages)
+        raise Exception("stop after capture")
+        yield  # pragma: no cover — makes this an async generator
+    async def complete(self, *a, **k):
+        return "CONTEXT SUMMARY:\nmock"
+_pc_mock_llm = _PCMockLLM(_pc_llm)
+agent._llm = _pc_mock_llm
+try:
+    _asyncio.run(_pc_collect(
+        agent.run_chat(_pc_sid2, "go", [], log=lambda *a: None)))
+except Exception:
+    pass
+finally:
+    agent._llm = _pc_llm
+_pc_msgs = _pc_mock_llm.captured or []
+_pc_user_rows = sum(1 for m in _pc_msgs
+                    if m.get("role") == "user" and "message number" in
+                    str(m.get("content", "")))
+check("rebuild loads FULL history (40-row session, no fixed tail)",
+      _pc_user_rows >= 20, f"only {_pc_user_rows} history rows rebuilt")
+
+# turn-boundary compaction: with the trigger set to ~0, the rebuild must
+# summarize + PERSIST (marker + summary on the session row) before the
+# first model call — and the call must carry the summary, not the rows
+_pc_sid3 = db.create_session()["id"]
+for i in range(30):
+    db.add_message(_pc_sid3, "user" if i % 2 == 0 else "assistant",
+                   f"boundary message {i} " + "y" * 300)
+_pc_mock2 = _PCMockLLM(_pc_llm)
+_pc_mock2.captured = None
+agent._llm = _pc_mock2
+_saved_trigger = config.settings.compact_trigger
+config.settings.compact_trigger = 100  # force the turn-boundary compact
+try:
+    _asyncio.run(_pc_collect(
+        agent.run_chat(_pc_sid3, "go", [], log=lambda *a: None)))
+except Exception:
+    pass
+finally:
+    agent._llm = _pc_llm
+    config.settings.compact_trigger = _saved_trigger
+_pc_sess3 = db.get_session(_pc_sid3)
+check("boundary compaction persists summary + marker on the session",
+      bool(_pc_sess3["compacted_summary"])
+      and (_pc_sess3["compacted_through_msg_id"] or 0) > 0)
+_pc_msgs3 = _pc_mock2.captured or []
+_pc_has_summary = any("CONTEXT SUMMARY" in str(m.get("content", ""))
+                      for m in _pc_msgs3)
+_pc_row_leak = sum(1 for m in _pc_msgs3
+                   if "boundary message" in str(m.get("content", "")))
+check("post-boundary model call carries the summary (not the full rows)",
+      _pc_has_summary and _pc_row_leak <= config.settings.compact_recent + 1,
+      f"summary={_pc_has_summary} leaked_rows={_pc_row_leak}")
+
 print("── 5. resume E2E (mocked model stream) ───────────────────────")
 import asyncio  # noqa: E402
 
@@ -649,6 +732,46 @@ db.queue_add(sidq, {"message": "ghost", "files": []})
 db.queue_clear(sidq)
 check("stop/drop clears the durable rows", db.queue_load(sidq) == [])
 
+# ── 7c. queue tray: edit (queue_update) + clear-all (queue_clear) ──────
+# The tray's ✎ rewrites a NOT-YET-RUN entry by position; clear-all drops
+# the whole FIFO. Both must mirror to the DB (durable) and report False/0
+# cleanly when the index is gone (the item drained between load and save —
+# the client then offers the edit back as a composer draft).
+
+async def _drive_qedit():
+    side = "q-tray-edit"
+    tme = tasks_mod.TaskManager(lambda *a: None)
+    async def _slow_e(sid, message, files, log, mode, roast, resume):
+        await asyncio.sleep(0.25)
+        yield 'event: status\ndata: {"text": "Working\u2026"}\n\n'
+        yield 'event: done\ndata: {"text": "ok"}\n\n'
+    agent_mod.run_chat = _slow_e
+    tme.enqueue(side, "qe-first", [], "act", "chill", False)
+    await asyncio.sleep(0.05)
+    tme.enqueue(side, "qe-old-text", [], "act", "chill", False)
+    tme.enqueue(side, "qe-third", [], "act", "chill", False)
+    # ✎ edit: rewrite index 0 (the head), durable + by-position
+    assert tme.queue_update(side, 0, "qe-NEW-text") is True
+    assert [e["message"] for e in tme.queues[side]] == ["qe-NEW-text", "qe-third"]
+    assert [r["message"] for r in db.queue_load(side)] == ["qe-NEW-text", "qe-third"]
+    # ✎ edit on a gone index (drained/removed) → False, caller re-syncs
+    assert tme.queue_update(side, 99, "nope") is False
+    # clear-all: drops everything, returns the count, mirrors to the DB
+    assert tme.queue_clear(side) == 2
+    assert tme.queue_count(side) == 0
+    assert db.queue_load(side) == []
+    assert tme.queue_clear(side) == 0  # idempotent on an empty queue
+    for _ in range(800):
+        r = tme.get(side)
+        if r is None or not r.active:
+            break
+        await asyncio.sleep(0.005)
+    return True
+
+check("queue tray: edit rewrites by position (durable) + clear-all",
+      asyncio.run(_drive_qedit()) is True)
+agent_mod.run_chat = _stub_run_chat
+
 # Regression: a restart kills an in-flight turn AND the user had queued a
 # follow-up → the queue restore autostarts the head. That head must
 # CONTINUE the interrupted task (resume=True, re-enters the saved
@@ -720,6 +843,27 @@ check("drain continues the interrupted task (resume=True, no restart)",
       and calls_q3[1][1] is True, str(calls_q3))
 check("drain cleared the queue + checkpoint",
       tmq4.queue_count(sidq3) == 0 and db.queue_load(sidq3) == [])
+# The drain must ANNOUNCE the pop on the NEW run's buffer: the client's
+# local tray pop can race the server-side pop (another tab, a reload
+# mid-run), and without this `queued` event the tray keeps the dead row
+# until a reload. A reconnecting client replays nrun's buffer from the
+# old run's seq, so the announcement must live in nrun, not the old run.
+nrun3 = tmq4.get(sidq3)
+announced = any("event: queued" in wire and '"queued": 0' in wire
+                for _, wire in (nrun3.buffer if nrun3 is not None else []))
+check("drain announces the pop on the new run's buffer (tray live-drop)",
+      announced,
+      str([w.strip()[:60] for _, w in
+           (nrun3.buffer if nrun3 is not None else [])]))
+# The announcement carries the FIRED text too: the client draws the fired
+# message's user bubble at the handoff, and for an item queued from another
+# tab the client's local peek is empty — the server's event is the only
+# authoritative source for what just ran.
+fired_ann = any("event: queued" in wire
+                and '"fired": "q3-queued-followup"' in wire
+                for _, wire in (nrun3.buffer if nrun3 is not None else []))
+check("drain-announce carries the fired text (client draws its bubble)",
+      fired_ann)
 db.clear_run_state(sidq3)
 
 # Drain-announce: when the head leaves the queue, the NEW run's buffer
@@ -784,8 +928,7 @@ check("queue_update on a gone index returns False (drain race → draft)",
       gone5 is False)
 check("queue_clear drops everything (idempotent, count 0 after)",
       n5 == 2 and cnt5 == 0 and tmq6.queue_clear(sidq5) == 0)
-
-# ── 7e. drain suppression is REASON-specific, not status-specific ──
+# ── 7e. drain suppression is REASON-specific, not status-specific ─────
 # Muji 10-04 incident: empty answer → `stopped` frame → auto-resume
 # enqueued the nudge 6 ms later (resume=1) → the drain's blanket
 # `status != "stopped"` skip (meant only for USER hard-stops) ate the
@@ -1584,7 +1727,63 @@ check("trim is a copy — DB rows stay intact",
 check("agent recall callers unaffected (no thinking_tail arg)",
       len(db.list_messages(sid12, limit=6)) == 6)
 
-print("── 13. search_transcript (recall beyond the 16-message window) ──")
+print("── 13. thinking-loop tripwire (480KB Narakeets run, 2026-10-06) ──")
+# the real degeneration: the same 8-word n-gram re-emitted dozens of times
+loop_text = ("Or \"Narakeets\" = \"Narakeets\" = \"Narakeets\" = \"Narakeets\" " * 300)
+check("degenerate loop trips", agent._thinking_loop_hit(loop_text))
+# a long but LEGITIMATE thinking stream must not trip: varied prose that
+# repeats a keyword a few times is normal CoT
+prose = " ".join(
+    f"step {i} considers the tradeoff of approach {i % 7} against the "
+    f"constraint set and moves on to the next candidate" for i in range(200))
+check("legit long thinking does NOT trip", not agent._thinking_loop_hit(prose))
+# short thinking is never a loop, even if repetitive
+check("short repetitive thinking does NOT trip (min_chars)",
+      not agent._thinking_loop_hit("Narakeets = Narakeets = " * 5))
+# a loop that STARTS at the tail (the live shape: clean thinking, then the
+# degeneration kicks in) still trips — the check window is the last 3000 chars
+tail_loop = ("reasoning normally about the problem here " * 30
+             + "Narakeets = Narakeets = " * 120)
+check("tail-onset loop trips", agent._thinking_loop_hit(tail_loop))
+# LONG-period tier (the AI Classes run, 2026-10-08): a ~70-word PARAGRAPH
+# re-emitted verbatim — the short tier (p<=12) is structurally blind to it
+para = ("The fix is to use querySelectorAll swcell so the stub matches "
+        "real browser behavior")  # 14 words — long tier (p>12), short
+# enough that many repeats fit the 3600-char long-tier window
+long_loop = (para + " ") * 80
+check("long-period paragraph loop trips", agent._thinking_loop_hit(long_loop))
+# the measured real shape: 77-word period, 100% tail coverage
+real_para = ("query all descendant cells and updating the stub to match real "
+             "browser behavior The fix is to use querySelectorAll swcell so "
+             "they have the swcell class so they won t be included in the "
+             "padding calculation and the conv slider updates the right "
+             "cells without touching the wrapper that the layout pass owns "
+             "separately from the slider state machine")  # 53 words
+real_loop = (real_para + " ") * 60
+check("measured AI-Classes 53-word loop trips", agent._thinking_loop_hit(real_loop))
+# healthy CoT that revisits the SAME paragraph twice (planning → re-check)
+# must NOT trip: the long tier needs >=3 exact repeats
+two_pass = ("thinking about approach one " * 20 + " " + para + " ...later... "
+            + " " + para + " " + "concluding with a different summary " * 20)
+check("two-pass revisit of a paragraph does NOT trip",
+      not agent._thinking_loop_hit(two_pass))
+# a period that is too long to be a loop (whole-window 'period') never trips
+check("all-unique long thinking does NOT trip",
+      not agent._thinking_loop_hit("".join(f"word{i} " for i in range(2000))))
+
+print("── 13b. per-round max_tokens cap (AI Classes 72-min burn, 2026-10-08) ──")
+from src import llm as llm_mod  # noqa: E402
+_k = llm_mod.LLM().stream_kwargs([{"role": "user", "content": "hi"}], 0.7)
+check("stream request carries max_tokens", _k.get("max_tokens") == config.settings.max_tokens,
+      str(_k.get("max_tokens")))
+check("max_tokens defaults to 32768", config.settings.max_tokens == 32768)
+_old = config.settings.max_tokens
+config.settings.max_tokens = 0
+_k2 = llm_mod.LLM().stream_kwargs([{"role": "user", "content": "hi"}], 0.7)
+check("max_tokens=0 omits the cap (unlimited)", "max_tokens" not in _k2)
+config.settings.max_tokens = _old
+
+print("── 14. search_transcript (recall beyond the 16-message window) ──")
 sid13 = db.create_session()["id"]
 db.rename_session(sid13, "recall-test-chat")
 for i in range(20):  # 20 msgs → the first half is OUTSIDE the 16-msg window
@@ -1605,24 +1804,7 @@ try:
 except tools.ToolError:
     check("unknown chat raises ToolError", True)
 
-print("── 14. thinking-loop tripwire (480KB Narakeets run, 2026-10-06) ──")
-# the real degeneration: the same 8-word n-gram re-emitted dozens of times
-loop_text = ("Or \"Narakeets\" = \"Narakeets\" = \"Narakeets\" = \"Narakeets\" " * 300)
-check("degenerate loop trips", agent._thinking_loop_hit(loop_text))
-# a long but LEGITIMATE thinking stream must not trip: varied prose that
-# repeats a keyword a few times is normal CoT
-prose = " ".join(
-    f"step {i} considers the tradeoff of approach {i % 7} against the "
-    f"constraint set and moves on to the next candidate" for i in range(200))
-check("legit long thinking does NOT trip", not agent._thinking_loop_hit(prose))
-# short thinking is never a loop, even if repetitive
-check("short repetitive thinking does NOT trip (min_chars)",
-      not agent._thinking_loop_hit("Narakeets = Narakeets = " * 5))
-# a loop that STARTS at the tail (the live shape: clean thinking, then the
-# degeneration kicks in) still trips — the check window is the last 3000 chars
-tail_loop = ("reasoning normally about the problem here " * 30
-             + "Narakeets = Narakeets = " * 120)
-check("tail-onset loop trips", agent._thinking_loop_hit(tail_loop))
+
 
 print()
 if FAILURES:

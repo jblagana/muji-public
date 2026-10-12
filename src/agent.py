@@ -59,7 +59,7 @@ HARD RULE — self-restart, narrowed (ratified 2026-09-24): you may restart the 
 Guidelines:
 - Use tools to verify instead of guessing file contents, command output, or web facts.
 - Date discipline: the system prompt's "Today's date" line is the ONLY authoritative "now". Dates inside conversation history and compaction summaries are from when those messages were written — never anchor "today/tomorrow/next <weekday>" on a date found in the history. When a relative date is load-bearing (a due date, an event, a deadline), confirm the current date with `run_command` (Get-Date) before writing it anywhere.
-- Recall, don't confabulate: your context is only the last ~16 messages — anything older is NOT in your head. When the user references an earlier discussion, decision, or detail you can't see in context, call search_transcript (query the DB) BEFORE answering, and say so if it finds nothing. Never invent "what we discussed earlier."
+- Recall, don't confabulate: your context is the recent messages plus a compacted summary of everything older — details from the summarized part may be paraphrased or missing. When the user references an earlier discussion, decision, or detail you can't see clearly in context, call search_transcript (query the DB) BEFORE answering, and say so if it finds nothing. Never invent "what we discussed earlier."
 - Don't overthink: act, don't deliberate. For a simple request, answer directly or make at most 1-2 tool calls; don't re-read files whose content is already in context, don't restate your plan before answering, and don't take extra speculative steps the user didn't ask for. This never licenses skipping a verification step — "simple" means trivial asks, not skipping the checks the other rules require.
 - No repeated conclusions: in a multi-tool turn, each text segment between tool calls must carry NEW information (a status line, or a finding from the tool just run) — never restate a finding you already stated in an earlier segment. State a result once, in the segment where it's established; later segments may add detail but must not re-announce it. The final answer is the one place a full summary belongs.
 - Verify math with tools: you predict tokens, you don't compute — any non-trivial arithmetic (multi-digit numbers, percentages, rates, stats, multi-step) must be computed with a tool (run_command, e.g. `python -c "print(...)"`) before you state the result; never answer it from your head. Trivial single-digit mental math is exempt; when you do compute via a tool, the number is tool-verified — say so if it's load-bearing.
@@ -396,6 +396,26 @@ def build_system(cwd: pathlib.Path, text_mode: bool, plan_mode: bool = False,
     elif roast == "full":
         p += ROAST_FULL_PROMPT
     return p
+
+
+def _refresh_date(msgs: list[dict]) -> bool:
+    """Mid-run date refresh: the system prompt's date is baked at turn
+    start, so a run that crosses midnight (or a resume of a run that
+    started the previous day) would otherwise answer with yesterday's
+    date — 'tomorrow' then lands on the wrong day. Re-stamp the line
+    only when the calendar day actually changed (string replace, not a
+    full rebuild — the session-notes/learned/tool-notes blocks are
+    unchanged within a run). Returns True when the prompt was updated."""
+    line = f"Today's date: {datetime.date.today().isoformat()}."
+    sp = msgs[0].get("content")
+    if not isinstance(sp, str) or line in sp:
+        return False
+    import re
+    sp2 = re.sub(r"Today's date: \d{4}-\d{2}-\d{2}\.", line, sp, count=1)
+    if sp2 != sp:
+        msgs[0] = {"role": "system", "content": sp2}
+        return True
+    return False
 
 
 LEARNED_SKELETON = """# learned.md — muji's learned patterns (human-gated)
@@ -1249,39 +1269,50 @@ def _thinking_loop_hit(window: str, min_chars: int = 2000,
                        min_repeats: int = 5, min_coverage: float = 0.35) -> bool:
     """True when the tail of the thinking stream is a repetition loop.
 
-    Detects the MINIMAL repeating period of the recent words and requires
-    it to be short (<= 12 words — a degeneration cycle is a phrase, not a
-    paragraph), repeated >= min_repeats times, and covering >= 35% of the
-    window. Why period, not n-gram count: the real 480 KB run cycled a
-    10-word unit ('Or Narakeets = Narakeets…') and an 8-gram only catches
-    one phase of that period (measured: 20% coverage — below any sane
-    threshold), while legitimate CoT that cycles a phrasing a few dozen
-    times has a period far larger than the window. Only evaluated once
-    the stream is long enough (min_chars) — short thinking is never a
+    Scans candidate periods p and measures how far back from the tail
+    p-periodicity holds (words[i] == words[i-p] for the whole suffix —
+    anchor-free, so a loop that STARTS mid-window still counts). Two
+    tiers:
+      short (p <= 12 words): >= 35% tail coverage — the 480 KB 'Or
+        Narakeets = Narakeets…' run (2026-10-06, 10-word period);
+      long (13 <= p <= 200 words): >= 90% tail coverage — the 497 KB
+        'AI Classes' run (2026-10-08) cycled a ~70-word PARAGRAPH 780x
+        (measured: period 77 words, 100% tail coverage), which the short
+        tier is structurally blind to. The long tier's bar is
+        deliberately near-total: a paragraph-scale exact repeat is rare
+        in healthy CoT, so a tail that is 90%+ one paragraph over and
+        over is already degeneration, while a legitimate revisit
+        (planning → re-check) shows 2 copies, not a 90%-periodic tail.
+    The `run += p` seed (the period itself) is kept below each tier's
+    coverage bar by construction (p/n <= 1/reps), so a window with ZERO
+    actual matches can never trip. The check window scales with the
+    period — a 24-word period needs a tail that actually CONTAINS
+    >=3 full repeats (a fixed 3000-char tail cuts mid-period and the
+    exact-periodicity check dies). Only evaluated once the stream is
+    long enough (min_chars / tier floor) — short thinking is never a
     loop."""
-    if len(window) < min_chars:
-        return False
-    words = re.findall(r"\w+", window[-3000:])
-    n = len(words)
-    if n < 16:
-        return False
-    for p in range(1, 13):
-        if n < p * min_repeats:
+    # tiers: (pmin, pmax, coverage, window chars, min stream chars, repeats)
+    tiers = ((1, 12, min_coverage, 3000, min_chars, min_repeats),
+             (13, 200, 0.90, 3600, 3600, 3))
+    for pmin, pmax, cov, win_chars, min_len, reps in tiers:
+        if len(window) < min_len:
             continue
-        # how far back from the tail does p-periodicity hold? (words[i] ==
-        # words[i-p] for the whole suffix — anchor-free, so a loop that
-        # STARTS mid-window still counts)
-        run = 0
-        for i in range(n - 1, p - 1, -1):
-            if words[i] == words[i - p]:
-                run += 1
-            else:
-                break
-        run += p  # the periodic suffix is `run + p` words long
-        # a degeneration cycle is a SHORT phrase; legitimate CoT cycles are
-        # paragraph-long and never p-periodic within 12 words
-        if run / n >= min_coverage:
-            return True
+        words = re.findall(r"\w+", window[-win_chars:])
+        n = len(words)
+        if n < 16:
+            continue
+        for p in range(pmin, pmax + 1):
+            if n < p * reps:
+                break  # larger periods can't fit reps either
+            run = 0
+            for i in range(n - 1, p - 1, -1):
+                if words[i] == words[i - p]:
+                    run += 1
+                else:
+                    break
+            run += p  # seed: the period itself (p/n <= 1/reps < cov)
+            if run / n >= cov:
+                return True
     return False
 
 
@@ -1494,15 +1525,19 @@ def _pdf_text(raw: bytes) -> str | None:
         return None
 
 
-def _maybe_auto_resume(session_id: str, error_msg: str, log) -> None:
+def _maybe_auto_resume(session_id: str, error_msg: str, log,
+                       force: bool = False) -> None:
     """Re-fire the boot auto-resume nudge for a TRANSIENT in-process LLM
     error (the mid-stream dead zone). No-op when: the setting is off,
     the error isn't transient (a 4xx model rejection is a real dead end —
     re-firing would just burn tokens to hit the same wall), the run_state
     is gone or deliberately stopped, the per-session budget is spent, or
     the manager is unavailable. The enqueue happens OUTSIDE the error
-    handler's turn (a fresh TaskRun), so it never re-enters this frame."""
-    if not is_transient_message(error_msg):
+    handler's turn (a fresh TaskRun), so it never re-enters this frame.
+    `force=True` bypasses the transient check for non-error stops that are
+    still genuinely resumable — the empty-answer case (the model ended the
+    round with no content; a retry is the right move, not a 4xx wall)."""
+    if not force and not is_transient_message(error_msg):
         return
     try:
         if not db.load_auto_approve().get("auto_resume"):
@@ -1714,13 +1749,41 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
         # resume nudge
         user_text = saved_state.get("goal") or user_text
     else:
-        history = db.list_messages(session_id, limit=16)
+        # Persisted compaction (2026-10-09, boss-approved — replaces the
+        # 30k CONTEXT_WINDOW experiment): the rebuild loads the session's
+        # FULL history — no fixed 16-row tail, no token-budget window.
+        # Everything older than the persisted marker is carried as the
+        # stored summary (one lossy pass per growth, not per turn);
+        # compaction is the sole memory manager. The ~220k in-turn valve
+        # below still guards long tool loops.
         messages: list[dict] = [
             {"role": "system",
              "content": build_system(cwd, _llm.mode == "text", plan_mode,
                                      roast, recall=user_text,
                                      session_id=session_id)}]
-        for m in history[:-1]:  # the last one is the user message just added
+        comp = sess.get("compacted_summary")
+        comp_id = int(sess.get("compacted_through_msg_id") or 0)
+        # fetch generously (each row is clamped to 24k chars ≈ 6k tokens;
+        # the boundary check below compacts before the request ever
+        # approaches the model's limit, and the clamp bounds memory)
+        history = db.list_messages(session_id, limit=2000)
+        if comp and comp_id:
+            # split at the marker: rows <= comp_id are already inside the
+            # summary; rows after it are the live tail
+            pre, tail = [], []
+            for m in history[:-1]:  # the last one is the user message just added
+                (pre if m["id"] <= comp_id else tail).append(m)
+            if pre:  # marker present but rows before it vanished (prune)
+                comp = ""  # a summary with nothing left to summarize
+        else:
+            tail = history[:-1]
+        if comp:
+            messages.append({"role": "user",
+                             "content": ("(Earlier conversation compacted — "
+                                         "this replaces it; re-read the task "
+                                         "notes file if one exists.)\n\n"
+                                         + comp)})
+        for m in tail:
             c = m["content"]
             if isinstance(c, str):
                 c = c[:24000]
@@ -1732,7 +1795,52 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
                         str(settings.uploads_dir / (f.get("name") or "?"))
                         for f in m["files"][:4])
                     c += f"\n\n(attachments from that message: {paths})"
+            else:
+                c = ""  # image-only history rows can't be rebuilt
             messages.append({"role": m["role"], "content": c})
+        # TURN-BOUNDARY COMPACTION: if the loaded context (system +
+        # summary + full tail) is already past the trigger, run the same
+        # two-step (clear tool results → LLM summary) NOW and persist the
+        # result — so the lossy pass runs once per growth, not per turn,
+        # and the first model call of this turn is small. (The boundary
+        # is the meter's 100% mark — the model's real limit — not a
+        # compaction point.)
+        # ctx_tokens floor (2026-10-12, TA-session bug): est_tokens() is a
+        # char/4 estimate that undercounts the real provider count (tool
+        # schemas + API overhead ≈ 10k) — a session running at 107k REAL
+        # tokens can estimate under the trigger and never compact. The
+        # previous turn's llm_end already persisted the real count to
+        # sessions.ctx_tokens; use it as a floor so the LLM summary fires
+        # when the provider says so, even if the estimate lags.
+        real_ctx = int(sess.get("ctx_tokens") or 0)
+        ctx_est = max(est_tokens(messages), real_ctx)
+        if (settings.compact_enabled
+                and ctx_est >= settings.compact_trigger):
+            freed = _clear_old_tool_results(messages, settings.compact_recent)
+            if freed:
+                log("info", f"cleared old tool results at rebuild "
+                            f"(~{freed // 4} est tokens freed)")
+            if max(est_tokens(messages), real_ctx) >= settings.compact_trigger:
+                log("info", f"compacting at turn boundary "
+                            f"(~{max(est_tokens(messages), real_ctx)} est tokens)")
+                compacted = await _compact_context(messages, log, session_id)
+                if compacted:
+                    messages = compacted
+                    # persist: the summary covers everything except the
+                    # keep-tail (settings.compact_recent) — the marker is
+                    # the last DB row that fell into the summarized part
+                    tail_rows = [m for m in history[:-1]
+                                 if not (comp and comp_id and m["id"] <= comp_id)]
+                    cut = max(0, len(tail_rows) - settings.compact_recent)
+                    if cut > 0:
+                        new_summary = _content_text(messages[1].get("content"))
+                        db.set_compaction(session_id, new_summary,
+                                          tail_rows[cut - 1]["id"])
+                        log("info", f"compaction persisted through "
+                                    f"message {tail_rows[cut - 1]['id']}")
+                    else:
+                        log("warn", "turn-boundary compaction ran but the "
+                                    "keep-tail covered all rows — nothing persisted")
         if image_parts:
             messages.append({"role": "user",
                              "content": [{"type": "text", "text": model_text},
@@ -1817,44 +1925,46 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
             _mode_msg = _sync_mode()
             if _mode_msg:
                 yield sse("status", {"text": _mode_msg})
-            # Context compaction: once the running conversation approaches
-            # the model's limit, summarize its older part into one message
-            # (the notes file + recent messages carry the rest).
-            # Trigger input: the provider's real prompt_tokens when we have
-            # them, char/4 estimate otherwise (round 1 / post-compact).
+            # Date drift: a run that crosses midnight (or a resume of a
+            # run started the previous day) must not keep answering with
+            # yesterday's date — 'tomorrow' would land on the wrong day.
+            if _refresh_date(messages):
+                log("info", "system prompt date refreshed mid-run")
+            # Mid-turn context management (boss design 2026-10-11): inside a
+            # turn, NEVER run the lossy summary — the turn runs on max recall
+            # so its work is undisturbed and converges faster. The only
+            # mid-turn action is the lossless clear: stub old tool results
+            # (the real token sink) once the context crosses the trigger.
+            # The LLM summary waits for the next turn boundary (rebuild).
+            # Trigger input: real provider tokens when we have them,
+            # char/4 estimate otherwise (round 1 / post-compact).
             ctx_now = (last_prompt_tokens
                        if last_prompt_tokens is not None
                        else est_tokens(messages))
-            if (settings.compact_enabled and turn > 1
+            # Boss-disabled 2026-10-12 (COMPACT_MID_TURN_CLEAR=0 default):
+            # the per-round stubbing of old tool results is OFF — a turn runs
+            # on full recall until the turn-boundary compaction (clear + LLM
+            # summary) fires. Overflow recovery's aggressive clear is the
+            # backstop and is untouched by this flag.
+            if (settings.compact_enabled and settings.compact_mid_turn_clear
+                    and turn > 1
                     and ctx_now >= settings.compact_trigger):
-                # Rule-based loss-reducer FIRST (Anthropic clear_tool_uses):
-                # old tool results are the real token sink — stub them before
-                # the LLM sees anything. If that alone drops under the
-                # trigger, the lossy summary is skipped entirely.
                 freed = _clear_old_tool_results(messages, settings.compact_recent)
                 if freed:
-                    log("info", f"cleared old tool results (~{freed // 4} est tokens freed)")
-                # After clearing, re-check the estimate (the real number
-                # predates the stubs; the estimate is the conservative
-                # post-clearing read).
-                if est_tokens(messages) >= settings.compact_trigger:
-                    # `compacting: true` is the machine-readable signal for
-                    # the topbar context pill (the status text is human-only)
-                    yield sse("status", {"text": "Context large — compacting…",
-                                         "compacting": True})
-                    log("info", f"compacting context (~{est_tokens(messages)} est tokens)")
-                    compacted = await _compact_context(messages, log, session_id)
-                    if compacted:
-                        messages = compacted
-                        # the pre-compact real number is now stale (the
-                        # context shrank) — fall back to the estimate until
-                        # the next round's usage chunk gives a fresh read
-                        last_prompt_tokens = None
-                        yield sse("status", {"text": f"Context compacted (~{est_tokens(messages)} est tokens)"})
-                        try:
-                            db.set_ctx_tokens(session_id, est_tokens(messages))
-                        except Exception:  # noqa: BLE001 — meter must never kill the turn
-                            pass
+                    log("info", f"cleared old tool results mid-turn (~{freed // 4} est tokens freed)")
+                    # the pre-clear real number is now stale (the context
+                    # shrank) — fall back to the estimate until the next
+                    # round's usage chunk gives a fresh read
+                    last_prompt_tokens = None
+                    yield sse("status",
+                              {"text": f"Context trimmed (~{est_tokens(messages)} est tokens)"})
+                    try:
+                        db.set_ctx_tokens(session_id, est_tokens(messages))
+                    except Exception:  # noqa: BLE001 — meter must never kill the turn
+                        pass
+                # freed == 0: nothing stub-able left (conversation text is
+                # what's big) — the lossy summary waits for the next turn
+                # boundary; the overflow recovery below is the backstop.
             # run-state checkpoint: a restart/crash mid-task can re-enter the
             # loop exactly here (saved AFTER compaction, so the persisted
             # conversation is the small one). One small write per turn.
@@ -2014,8 +2124,9 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
                     #    (keep-tail 1 = nothing is "recent" enough to keep)
                     freed = _clear_old_tool_results(messages, 1)
                     # 2) still over? hard-truncate the oldest middle
-                    #    messages down to a safe budget (45k chars ≈ 11k
-                    #    tokens under the 220k trigger)
+                    #    messages down to a safe budget (11k tokens under
+                    #    the trigger — the retry must fit with headroom,
+                    #    whatever the server's real limit is)
                     if est_tokens(messages) * 4 > (settings.compact_trigger - 11000) * 4:
                         dropped = _hard_truncate(
                             messages, (settings.compact_trigger - 11000) * 4)
@@ -2545,6 +2656,13 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
                 yield sse("stopped",
                           {"reason": "model returned an empty answer",
                            "finish_reason": finish_reason})
+                # In-process re-fire (the boot path only fires on restart —
+                # an in-process stop on a live server would sit parked
+                # until the next boot). force=True: an empty answer isn't
+                # an LLMError, but it IS worth a retry — the budget cap
+                # (3/session) stops a permanently-empty model from looping.
+                _maybe_auto_resume(session_id, "empty answer", log,
+                                   force=True)
             return
         # max turns exhausted — a resumable stop, not a dead end
         # (the UI shows the reason + a Resume button)

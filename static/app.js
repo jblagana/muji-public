@@ -65,10 +65,8 @@
     sessionId: localStorage.getItem("muji.sid") || null,
     processing: false,
     resumable: false,      // server has saved loop state for this chat → ↻ re-enters it
-    learned: { pending: [], active: [], loaded: false,
-    dismissedSig: localStorage.getItem("learn.dismissedSig") || null },  // learned.md human gate (persisted: refresh must not un-dismiss)
-  toolNotes: { pending: [], active: [], loaded: false,
-    dismissedSig: localStorage.getItem("wench.dismissedSig") || null },  // tool_notes.md — own gate, own record (separate button/panel)
+    learned: { pending: [], active: [], loaded: false },  // learned.md human gate — topbar 🧠 only (composer banner retired 2026-10-12)
+    toolNotes: { pending: [], active: [], loaded: false },  // tool_notes.md — topbar 🔧 only
     mode: "act",           // Plan/Act for the visible chat (Cline-style, per chat)
     roast: "chill",        // roast level for the visible chat (off|chill|full)
     attachments: [],        // [{name, url, original}]
@@ -151,10 +149,8 @@
     queueTray: $("queue-tray"),
     scrollBottomBtn: $("scroll-bottom-btn"),
     supStrip: $("sup-strip"), supSummary: $("sup-summary"), supBoard: $("sup-board"),
-    learnBanner: $("learn-banner"), learnCount: $("learn-count"), learnList: $("learn-list"),
-    learnReviewBtn: $("learn-review-btn"), learnLaterBtn: $("learn-later-btn"), learnOpen: $("learn-open"),
-    wenchBanner: $("wench-banner"), wenchCount: $("wench-count"), wenchList: $("wench-list"),
-    wenchReviewBtn: $("wench-review-btn"), wenchLaterBtn: $("wench-later-btn"), wenchOpen: $("wench-open"),
+    learnPanel: $("learn-panel"), learnList: $("learn-list"), learnOpen: $("learn-open"),
+    wenchPanel: $("wench-panel"), wenchList: $("wench-list"), wenchOpen: $("wench-open"),
     latOpen: $("lat-open"), latDrawer: $("lat-drawer"), latDim: $("lat-dim"),
     latClose: $("lat-close"), latSub: $("lat-sub"),
     latBtnTok: $("lat-btn-tok"), latBtnMs: $("lat-btn-ms"),
@@ -207,6 +203,10 @@
       const t = title ? ` title="${title}"` : "";
       return `<a href="${href || ""}"${t} target="_blank" rel="noopener noreferrer">${text}</a>`;
     },
+    // GFM `~text~` → <del> (strikethrough) eats "approximately" tildes in
+    // agent text ("~1.5k tok … ~550") and strikes everything between.
+    // Strikethrough is never intentional in chat — render it as plain text.
+    del(token) { return token.text; },
   }});
 
   async function api(path, opts) {
@@ -3547,6 +3547,22 @@
               openStream(sid, view(sid).seq);
           }, 4000);
         };
+        // Drain resync: the server pops the head in its own finally (a
+        // moment after our `done` frame) and announces it on the `queued`
+        // channel — but that event rides the NEW run's buffer, which this
+        // stream may not replay (the onerror reconnect re-subscribes from
+        // the old run's seq; the replay only carries it if the client
+        // reattaches after the new run's first frame). A delayed resync
+        // after the handoff gap makes the server's post-drain list
+        // authoritative again — the tray row (or its absence) settles
+        // either way. NOTE: the guard must NOT be v.draining — the next
+        // run's `status` frame clears it well before this timer fires,
+        // which is exactly when the resync is still needed.
+        if ((state.queues[sid] || []).length || v._nextJob) {
+          setTimeout(() => {
+            if (state.sessionId === sid) syncQueueFromServer(sid);
+          }, 1500);
+        }
         if (v._nextJob) handoff(v._nextJob);
         else if ((state.queues[sid] || []).length) handoff("Working…");
         else syncQueueFromServer(sid).then(() => {
@@ -3823,7 +3839,7 @@
   // controls survive a tab reload by construction. (The old transcript
   // placeholders were in-memory and died on reload, leaving only a dumb
   // non-cancellable chip behind — that was the bug this replaces.)
-  let queueExpanded = false;  // the tray is COLLAPSED by default
+  let queueExpanded = false;  // the tray is COLLAPSED by default (boss call 2026-10-12, reversed)
   let queueEditIndex = -1;    // the item currently in inline-edit mode
 
   function renderQueueTray(sid) {
@@ -4195,19 +4211,20 @@
     }
   }
 
-  // ── the human gate: two buttons, two panels, two record stores ─────────
+  // ── the human gate: two topbar buttons, two panels, two record stores ──
   // 🧠 brain  = learned.md    (my failures) — /api/learned
   // 🔧 wench  = tool_notes.md (verified tool quirks) — /api/tool_notes
-  // Each banner sits above the composer and offers a review whenever its
-  // file's `## pending` is non-empty. Deterministic + app-level (not the
-  // model) so it's reliable and free. Save rewrites the file via its own
-  // decide endpoint — the model still never self-activates; the file is the
-  // single source of truth. Dismissals are per-source (separate records).
+  // No composer banner (retired 2026-10-12, boss call): new pending entries
+  // don't pop above the composer — the list is only shown when the boss
+  // opens it via the topbar buttons. A dot on the button marks pending.
+  // Deterministic + app-level (not the model) so it's reliable and free.
+  // Save rewrites the file via its own decide endpoint — the model still
+  // never self-activates; the file is the single source of truth.
   function srcState(src) { return src === "toolnote" ? state.toolNotes : state.learned; }
   function srcEl(src) {
     return src === "toolnote"
-      ? { banner: el.wenchBanner, count: el.wenchCount, list: el.wenchList, open: el.wenchOpen }
-      : { banner: el.learnBanner, count: el.learnCount, list: el.learnList, open: el.learnOpen };
+      ? { panel: el.wenchPanel, list: el.wenchList, open: el.wenchOpen }
+      : { panel: el.learnPanel, list: el.learnList, open: el.learnOpen };
   }
   function allPending(src) {
     const st = srcState(src);
@@ -4217,8 +4234,6 @@
     const st = srcState(src);
     return st.active.map((t) => ({ src, text: t }));
   }
-  function learnSig(src) { return allPending(src).map((r) => r.src + ":" + r.text).join("\u241f"); }
-
   async function loadLearned() {
     let data;
     try { data = await (await api("/api/learned")).json(); } catch (e) { return; }
@@ -4232,25 +4247,15 @@
       state.toolNotes.active = tn.active || [];
       state.toolNotes.loaded = true;
     }
-    renderLearnedBanner("learned");
-    if (state.toolNotes.loaded) renderLearnedBanner("toolnote");
+    renderLearnedDot("learned");
+    if (state.toolNotes.loaded) renderLearnedDot("toolnote");
   }
 
-  // One banner per source file — each has its own count, list, Review/Later,
-  // and its own dismiss record (per-source dismissedSig).
-  function renderLearnedBanner(src) {
-    const st = srcState(src), e = srcEl(src);
-    const n = allPending(src).length;
-    const dismissed = n > 0 && st.dismissedSig === learnSig(src);
-    e.banner.hidden = !n || dismissed;
-    // button indicator: dot while pending records exist but the banner is
-    // hidden ("Later") — click the button to bring it back
-    e.open.classList.toggle("has-pending", !!n && dismissed);
-    if (n) {
-      const word = src === "toolnote" ? "quirk" : "pattern";
-      e.count.textContent = n + " " + (n === 1 ? word : word + "s") +
-        " logged while working — activate or veto?";
-    }
+  // No banner: the only ambient signal is a dot on the topbar button while
+  // its file has pending entries. The list itself opens on demand.
+  function renderLearnedDot(src) {
+    const e = srcEl(src);
+    e.open.classList.toggle("has-pending", allPending(src).length > 0);
   }
 
   function learnDecideButtons() {
@@ -4330,19 +4335,18 @@
     L.appendChild(actions);
   }
 
-  function openLearnedList(src) { buildLearnedList(src); srcEl(src).list.hidden = false; }
-  // "Later" / Cancel: tuck the banner back into its button (top bar) — the
-  // dot there marks it as still pending; click the button to bring it back.
-  // Each source keeps its own dismiss record.
+  function openLearnedList(src) {
+    buildLearnedList(src);
+    const e = srcEl(src);
+    // The panel floats above the composer (banner retired 2026-10-12) —
+    // shown only while open; new pending entries never pop it on their own.
+    e.panel.hidden = false;
+  }
+  // Cancel: close the panel. The topbar dot marks pending until it's cleared.
   function closeLearnedList(src) {
-    const st = srcState(src), e = srcEl(src);
-    e.list.hidden = true;
-    e.banner.hidden = true;
-    st.dismissedSig = learnSig(src);   // stop nagging until the set changes
-    localStorage.setItem(
-      src === "toolnote" ? "wench.dismissedSig" : "learn.dismissedSig",
-      st.dismissedSig);
-    e.open.classList.toggle("has-pending", allPending(src).length > 0);
+    const e = srcEl(src);
+    e.panel.hidden = true;
+    renderLearnedDot(src);
   }
 
   async function saveLearned(src) {
@@ -4373,10 +4377,10 @@
         totals.deactivated += res.deactivated || 0;
       } catch (err) { learnToast("Save failed — try again"); return; }
     }
-    e.list.hidden = true;
+    e.panel.hidden = true;
     learnToast(totals.activated + " activated, " + totals.vetoed + " vetoed, " +
                totals.deactivated + " deactivated");
-    renderLearnedBanner(src);
+    renderLearnedDot(src);
   }
 
   let learnToastEl = null;
@@ -5206,19 +5210,22 @@
   }
 
   // ── Context meter (topbar, far left) ─────────────────────────
-  // Fill of this chat's context vs the compaction trigger. `toks` is the
-  // chat's last known context size (the model's prompt_tokens, persisted on
-  // sessions.ctx_tokens). Hidden for a fresh chat (no data yet). The
-  // compacting flag dims it + swaps the % for a label while the compaction
-  // step runs (server's status frame carries `compacting: true`).
+  // Fill of this chat's context vs the model's real limit (boundary =
+  // the 100% mark). `toks` is the chat's last known context size (the
+  // model's prompt_tokens, persisted on sessions.ctx_tokens). Hidden for
+  // a fresh chat (no data yet). The sublabel shows where compaction
+  // actually fires (trigger, at turn boundaries). The compacting flag
+  // dims it + swaps the % for a label while the compaction step runs
+  // (server's status frame carries `compacting: true`).
   function renderCtxMeter(toks, compacting) {
     const trig = (state.config && state.config.compact_trigger) || 0;
+    const bound = (state.config && state.config.compact_boundary) || trig || 0;
     if (toks) state.ctxToks = toks;  // remember for the compacting flip
-    if (!trig || !toks || toks <= 0) {
+    if (!bound || !toks || toks <= 0) {
       el.ctxMeter.hidden = true;
       return;
     }
-    const pct = Math.min(100, Math.round((toks / trig) * 100));
+    const pct = Math.min(100, Math.round((toks / bound) * 100));
     el.ctxMeter.hidden = false;
     el.ctxMeter.classList.toggle("warn", !compacting && pct >= 60 && pct < 85);
     el.ctxMeter.classList.toggle("hot", !compacting && pct >= 85);
@@ -5226,9 +5233,9 @@
     el.ctxFill.style.width = pct + "%";
     el.ctxPct.textContent = compacting ? "compacting…" : pct + "%";
     const fmt = (n) => (n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, "") + "k" : String(n));
-    el.ctxNum.textContent = fmt(toks) + " / " + fmt(trig);
+    el.ctxNum.textContent = fmt(toks) + " / " + fmt(bound);
     el.ctxSub.textContent = compacting ? "summarizing now"
-      : "auto-compacts at " + fmt(trig);
+      : (trig ? "compacts at " + fmt(trig) : "model limit");
   }
   // Feed the meter from the current session row (session switch / refresh).
   // A session row never knows about in-flight compaction, so by default
@@ -6834,27 +6841,22 @@
       const h = await (await fetch("/api/health", { cache: "no-store" })).json();
       if (h.boot_id) state.bootId = h.boot_id;
     } catch (e) { /* server flaky at boot — skip the detector */ }
-    // Review banners: the brain (🧠 learned.md) and wench (🔧 tool_notes.md)
-    // buttons each toggle their own banner — opens it (even after "Later"),
-    // closes it when it's visible; Review/Later toggle the per-record
-    // activate/keep/veto list. Separate panels, separate records.
-    el.learnReviewBtn.addEventListener("click", () => openLearnedList("learned"));
-    el.learnLaterBtn.addEventListener("click", () => closeLearnedList("learned"));
-    el.wenchReviewBtn.addEventListener("click", () => openLearnedList("toolnote"));
-    el.wenchLaterBtn.addEventListener("click", () => closeLearnedList("toolnote"));
+    // Review panels: the brain (🧠 learned.md) and wench (🔧 tool_notes.md)
+    // topbar buttons each toggle their own panel — opens it on demand,
+    // closes it when it's visible. No composer banner (retired 2026-10-12):
+    // new pending entries only light the button's dot.
     const wireReviewButton = (src) => (async () => {
-      // toggle: banner visible → close it (tuck back into the button);
-      // hidden → re-open it
+      // toggle: panel visible → close it; hidden → open it
       const e = srcEl(src);
-      if (!e.banner.hidden) { closeLearnedList(src); return; }
+      if (!e.panel.hidden) { closeLearnedList(src); return; }
       if (!srcState(src).loaded) await loadLearned();
+      // Always open the list — 0 pending + 0 active still shows the empty
+      // panel (with a toast), and 0 pending + N active shows the active
+      // section, which is viewable/deactivatable.
       if (!allPending(src).length && !allActive(src).length) {
-        learnToast(src === "toolnote" ? "No quirks to review yet"
-                                      : "No patterns to review yet");
-        return;
+        learnToast(src === "toolnote" ? "No quirks logged yet"
+                                      : "No patterns logged yet");
       }
-      srcState(src).dismissedSig = null;   // un-dismiss: banner stays until "Later"
-      renderLearnedBanner(src);
       openLearnedList(src);
     });
     el.learnOpen.addEventListener("click", wireReviewButton("learned"));
