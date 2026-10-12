@@ -152,10 +152,11 @@ class Settings:
         #                       topbar shows distance to the wall.
         #   COMPACT_TRIGGER   = where the LOSSY summary pass fires: at turn
         #                       boundaries (rebuild) when context >= trigger.
-        #                       Mid-turn, old tool results used to be
-        #                       cleared (lossless) per round — now OFF by
-        #                       default (COMPACT_MID_TURN_CLEAR), so a turn
-        #                       runs on full recall until the boundary pass.
+        #                       Mid-turn, old tool results are cleared
+        #                       (lossless) per round once the trigger is
+        #                       crossed (COMPACT_MID_TURN_CLEAR, on by
+        #                       default) — the turn keeps full recall of
+        #                       conversation text, only tool output is stubbed.
         self.compact_enabled = os.environ.get("COMPACT_ENABLED", "1") == "1"
         # PERSISTED COMPACTION (boss-approved 2026-10-09, replaces the
         # CONTEXT_WINDOW experiment): the per-turn rebuild loads the
@@ -169,12 +170,12 @@ class Settings:
         self.compact_context_limit = int(os.environ.get("COMPACT_CONTEXT_LIMIT", "265000"))
         self.compact_trigger = int(os.environ.get("COMPACT_TRIGGER", "100000"))
         self.compact_recent = int(os.environ.get("COMPACT_RECENT", "4"))
-        # MID-TURN LOSSLESS CLEAR (boss-disabled 2026-10-12): the per-round
-        # tool-result stubbing that ran every round once context crossed the
-        # trigger. Off by default — a turn now runs on full recall until the
-        # turn BOUNDARY compaction (clear + LLM summary) fires; the overflow
-        # recovery's aggressive clear is untouched and remains the backstop.
-        self.compact_mid_turn_clear = os.environ.get("COMPACT_MID_TURN_CLEAR", "0") == "1"
+        # MID-TURN LOSSLESS CLEAR (boss re-enabled 2026-10-13): the per-round
+        # tool-result stubbing runs every round once context crosses the
+        # trigger — ON by default. The lossy LLM summary still waits for the
+        # turn BOUNDARY compaction; the overflow recovery's aggressive clear
+        # is untouched and remains the backstop.
+        self.compact_mid_turn_clear = os.environ.get("COMPACT_MID_TURN_CLEAR", "1") == "1"
         self.command_timeout = int(os.environ.get("COMMAND_TIMEOUT", "120"))
         self.approval_timeout = int(os.environ.get("APPROVAL_TIMEOUT", "180"))
         self.question_timeout = int(os.environ.get("QUESTION_TIMEOUT", "180"))

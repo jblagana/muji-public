@@ -220,18 +220,18 @@ def test_settings():
     assert settings.compact_context_limit == int(
         os.environ.get("COMPACT_CONTEXT_LIMIT", "265000"))
     assert settings.compact_recent == int(os.environ.get("COMPACT_RECENT", "4"))
-    # mid-turn lossless clear: disabled by default (boss 2026-10-12) unless
-    # the env explicitly turns it back on
+    # mid-turn lossless clear: enabled by default (boss re-enabled
+    # 2026-10-13) unless the env explicitly turns it off
     assert settings.compact_mid_turn_clear == (
-        os.environ.get("COMPACT_MID_TURN_CLEAR", "0") == "1")
+        os.environ.get("COMPACT_MID_TURN_CLEAR", "1") == "1")
     print("settings ok")
 
 
 def test_mid_turn_clear_wiring():
     """The per-round tool-result stubbing must be gated on
-    COMPACT_MID_TURN_CLEAR (off by default): the mid-turn clear call sits
-    behind the flag, while the overflow recovery's aggressive clear
-    (keep-tail 1) stays ungated — it's the backstop."""
+    COMPACT_MID_TURN_CLEAR (on by default since 2026-10-13): the mid-turn
+    clear call sits behind the flag, while the overflow recovery's
+    aggressive clear (keep-tail 1) stays ungated — it's the backstop."""
     import src.agent as agent
     src = Path(agent.__file__).read_text(encoding="utf-8")
     # the gate: flag in the mid-turn condition
@@ -247,8 +247,8 @@ def test_mid_turn_clear_wiring():
     rec_clear = src.index("_clear_old_tool_results(messages, 1)")
     assert rec < rec_clear
     assert "settings.compact_mid_turn_clear" not in src[rec:rec_clear]
-    # default is OFF
-    assert settings.compact_mid_turn_clear is False
+    # default is ON (re-enabled 2026-10-13)
+    assert settings.compact_mid_turn_clear is True
     print("mid-turn clear wiring ok")
 
 

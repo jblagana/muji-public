@@ -1941,11 +1941,12 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
             ctx_now = (last_prompt_tokens
                        if last_prompt_tokens is not None
                        else est_tokens(messages))
-            # Boss-disabled 2026-10-12 (COMPACT_MID_TURN_CLEAR=0 default):
-            # the per-round stubbing of old tool results is OFF — a turn runs
-            # on full recall until the turn-boundary compaction (clear + LLM
-            # summary) fires. Overflow recovery's aggressive clear is the
-            # backstop and is untouched by this flag.
+            # Per-round lossless clear (re-enabled 2026-10-13, boss): once
+            # context crosses the trigger, old tool results are stubbed every
+            # round (lossless — conversation text is untouched). The lossy
+            # LLM summary still waits for the turn-boundary compaction.
+            # Overflow recovery's aggressive clear is the backstop and is
+            # untouched by this flag.
             if (settings.compact_enabled and settings.compact_mid_turn_clear
                     and turn > 1
                     and ctx_now >= settings.compact_trigger):
