@@ -31,6 +31,14 @@ config.settings.db_path = _tmp / "test.db"
 config.settings.results_dir = _tmp / "results"
 config.settings.results_dir.mkdir(parents=True, exist_ok=True)
 config.settings.learned_path = _tmp / "learned.md"
+# start on the "default" profile whatever the LIVE data/active_profile.json
+# says (a user profile changes limits/caps), and keep profile writes in temp
+import tempfile as _tfp  # noqa: E402
+_ptmp = _tfp.mkdtemp(prefix="muji_prof_")
+config_mod = __import__("src.config", fromlist=["x"])
+config_mod._profile_file = lambda: _ptmp + "/active_profile.json"
+config_mod._custom_profiles_file = lambda: _ptmp + "/model_profiles.json"
+config_mod.settings.set_profile("default")
 
 from src import agent, db, tools  # noqa: E402
 
@@ -253,7 +261,8 @@ print("── 4. schema sanity (public build: personal tools opt-in) ───�
 # no module reload, which would desync the agent's held references.)
 _default_disabled = config.settings.tools_disabled
 schemas = {s["function"]["name"] for s in tools.openai_schemas()}
-check("core tools advertised by default", len(schemas) == 16, str(len(schemas)))
+# +1 = load_tools (on-demand tool groups, token diet 2026-11-08)
+check("core tools advertised by default", len(schemas) == 17, str(len(schemas)))
 check("set_cwd + note_fact present by default (session memory, not personal)",
       {"set_cwd", "note_fact"} <= schemas)
 check("search_transcript present (transcript recall)", "search_transcript" in schemas)
@@ -267,7 +276,7 @@ check("IMAP email tools absent",
 # Opt-IN: an empty disabled set re-enables every tool (24 total).
 config.settings.tools_disabled = frozenset()
 schemas_on = {s["function"]["name"] for s in tools.openai_schemas()}
-check("opt-in (disabled=∅) enables all 26 tools", len(schemas_on) == 26, str(len(schemas_on)))
+check("opt-in (disabled=∅) enables all 27 tools", len(schemas_on) == 27, str(len(schemas_on)))
 check("set_cwd + note_fact present (session memory)",
       {"set_cwd", "note_fact"} <= schemas_on)
 check("personal tools present when opted in",
@@ -476,8 +485,10 @@ m = captured.get("messages") or []
 check("resume: system first", bool(m) and m[0]["role"] == "system")
 check("resume: saved conversation re-used verbatim", m[1:4] == saved_msgs,
       json.dumps(m[1:4])[:200])
+# the turn's volatile context (session notes/recall) is prepended to it
 check("resume: nudge appended last",
-      len(m) > 4 and m[-1] == {"role": "user", "content": RESUME})
+      len(m) > 4 and m[-1]["role"] == "user"
+      and isinstance(m[-1]["content"], str) and m[-1]["content"].endswith(RESUME))
 check("resume: plan restored", 'event: plan' in "".join(frames))
 check("resume: turn finished with done", 'event: done' in "".join(frames))
 check("resume: run_state consumed", db.load_run_state(sid) is None)

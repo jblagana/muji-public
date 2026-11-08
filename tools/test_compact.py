@@ -7,6 +7,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.agent import est_tokens, _compact_context, _clear_old_tool_results  # noqa: E402
 from src.config import settings  # noqa: E402
+# start on the "default" profile whatever the LIVE data/active_profile.json
+# says (a user profile changes limits/caps), and keep profile writes in temp
+import tempfile as _tfp  # noqa: E402
+_ptmp = _tfp.mkdtemp(prefix="muji_prof_")
+config_mod = __import__("src.config", fromlist=["x"])
+config_mod._profile_file = lambda: _ptmp + "/active_profile.json"
+config_mod._custom_profiles_file = lambda: _ptmp + "/model_profiles.json"
+config_mod.settings.set_profile("default")
 
 
 def test_est_tokens():
