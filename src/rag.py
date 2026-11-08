@@ -155,11 +155,14 @@ def _embed_batch(texts: list[str]) -> list[list[float]] | None:
     model = _embed_model()
     if not model or not settings.base_url:
         return None
-    url = settings.base_url.rstrip("/") + "/embeddings"
+    # pinned to the "default" profile — the chat model may be switched to a
+    # provider with no embeddings endpoint for RAG_EMBED_MODEL
+    embed_url, embed_key = settings.embed_endpoint()
+    url = embed_url.rstrip("/") + "/embeddings"
     try:
         r = httpx.post(
             url,
-            headers={"Authorization": f"Bearer {settings.api_key}"},
+            headers={"Authorization": f"Bearer {embed_key}"},
             json={"model": model, "input": texts},
             timeout=60,
         )

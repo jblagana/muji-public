@@ -1,8 +1,10 @@
 """App settings, loaded from environment / .env file."""
 from __future__ import annotations
 
+import json
 import os
 import pathlib
+import re
 
 APP_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -40,9 +42,129 @@ def _keychain_secret(service: str, username: str) -> str:
     is missing), so callers fall back to the env var."""
     try:
         import keyring
-        return keyring.get_password(service, username) or ""
+        value = (keyring.get_password(service, username) or "").strip()
     except Exception:
         return ""
+    # a placeholder left in Credential Manager for the user to fill in
+    # (e.g. "PASTE_YOUR_KEY_HERE") is "no key", not a bad key
+    if value.upper().startswith("PASTE_"):
+        return ""
+    return value
+
+
+# ── Model profiles (ported from muji, 2026-11-08) ──────────────────────
+# A profile = one OpenAI-compatible endpoint + model + its quirks. The only
+# BUILT-IN profile is "default", seeded from .env (OPENAI_BASE_URL / MODEL /
+# OPENAI_API_KEY); every other provider (Groq, OpenAI, OpenRouter, Together,
+# a self-hosted vLLM…) is added from the UI's "Manage profiles…" panel.
+# Non-secret fields live in data/model_profiles.json; API KEYS live only in
+# the OS keychain (service "muji", user "profile_key:<name>") and are never
+# returned to the browser. The active profile persists in
+# data/active_profile.json and switches live, no restart.
+BUILTIN_PROFILES = ("default",)
+PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
+
+#: How a profile's endpoint takes "thinking" control (THINKING=low|medium|high|xhigh|off):
+#:   qwen        — Qwen3 on vLLM: reasoning_effort low|medium|xhigh, off =
+#:                 chat_template_kwargs.enable_thinking=False (vLLM-only param)
+#:   qwen_hosted — Qwen3 on a hosted API (Groq): low|medium|high, off -> "none"
+#:   openai      — OpenAI-style reasoning_effort low|medium|high (gpt-oss, o-series)
+#:   none        — send nothing (most non-reasoning models reject the param)
+THINKING_STYLES = ("qwen", "qwen_hosted", "openai", "none")
+
+
+def _compat_fields(p: dict) -> dict:
+    style = p.get("thinking_style")
+    if style not in THINKING_STYLES:
+        style = "openai" if p.get("reasoning_effort") else "none"
+    try:
+        mt = max(0, int(p.get("max_tokens") or 0))
+    except (TypeError, ValueError):
+        mt = 0
+    return {"thinking_style": style, "reasoning_effort": style != "none",
+            "vision": bool(p.get("vision", False)), "max_tokens": mt}
+
+
+def _default_profiles() -> dict:
+    return {
+        "default": {
+            "base_url": os.environ.get("OPENAI_BASE_URL", ""),
+            "model": os.environ.get("MODEL", ""),
+            "compact_boundary": int(os.environ.get("COMPACT_BOUNDARY", "256000")),
+            **_compat_fields({
+                "thinking_style": os.environ.get("THINKING_STYLE", "none"),
+                "vision": os.environ.get("MODEL_VISION", "0") == "1",
+                "max_tokens": 0}),
+        },
+    }
+
+
+def _profile_file() -> str:
+    return str(APP_ROOT / "data" / "active_profile.json")
+
+
+def _custom_profiles_file() -> str:
+    return str(APP_ROOT / "data" / "model_profiles.json")
+
+
+def _load_custom_profiles() -> dict:
+    try:
+        with open(_custom_profiles_file(), encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return {}
+    out = {}
+    for name, p in (raw or {}).items():
+        if (name in BUILTIN_PROFILES or not PROFILE_NAME_RE.match(name)
+                or not isinstance(p, dict) or not p.get("base_url") or not p.get("model")):
+            continue
+        out[name] = {"base_url": str(p["base_url"]), "model": str(p["model"]),
+                     "compact_boundary": int(p.get("compact_boundary") or 131072),
+                     **_compat_fields(p)}
+    return out
+
+
+def _save_custom_profiles(profiles: dict) -> None:
+    os.makedirs(os.path.dirname(_custom_profiles_file()), exist_ok=True)
+    tmp = _custom_profiles_file() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(profiles, f, indent=2)
+    os.replace(tmp, _custom_profiles_file())
+
+
+def _load_active_profile() -> str:
+    try:
+        with open(_profile_file(), encoding="utf-8") as f:
+            name = json.load(f).get("profile", "")
+            if name in _default_profiles() or name in _load_custom_profiles():
+                return name
+    except Exception:
+        pass
+    return "default"
+
+
+def _save_active_profile(name: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(_profile_file()), exist_ok=True)
+        with open(_profile_file(), "w", encoding="utf-8") as f:
+            json.dump({"profile": name}, f)
+    except Exception:
+        pass
+
+
+def _keychain_set(service: str, username: str, secret: str) -> None:
+    """Store a secret in the OS keychain. Raises on failure — callers must
+    NOT fall back to writing the secret into a file."""
+    import keyring
+    keyring.set_password(service, username, secret)
+
+
+def _keychain_delete(service: str, username: str) -> None:
+    try:
+        import keyring
+        keyring.delete_password(service, username)
+    except Exception:
+        pass
 
 
 def _path(value: str, default: pathlib.Path) -> pathlib.Path:
@@ -73,6 +195,19 @@ class Settings:
             or "sk-no-key"
         )
         self.model = os.environ.get("MODEL", "")
+        # model profiles (see the module-level block): the .env/keychain key
+        # is the "default" profile's; the active profile overrides
+        # base_url / model / api_key / limits at the end of __init__
+        self._default_key = self.api_key
+        self._groq_key = (_keychain_secret("muji", "groq_api_key")
+                          or os.environ.get("GROQ_API_KEY", ""))
+        self.profiles = _default_profiles()
+        self.profiles.update(_load_custom_profiles())
+        self.active_profile = _load_active_profile()
+        self.reasoning_effort_ok = True
+        self.thinking_style = "none"
+        self.vision = False
+        self.profile_max_tokens = 0
 
         # Tavily web search (optional — when empty, web_search falls back to
         # the DuckDuckGo→Bing scrape chain). Secret resolution mirrors the
@@ -169,6 +304,8 @@ class Settings:
         self.compact_boundary = int(os.environ.get("COMPACT_BOUNDARY", "256000"))
         self.compact_context_limit = int(os.environ.get("COMPACT_CONTEXT_LIMIT", "265000"))
         self.compact_trigger = int(os.environ.get("COMPACT_TRIGGER", "100000"))
+        # set_profile clamps the trigger below a smaller model's window
+        self._compact_trigger_env = self.compact_trigger
         self.compact_recent = int(os.environ.get("COMPACT_RECENT", "4"))
         # MID-TURN LOSSLESS CLEAR (boss re-enabled 2026-10-13): the per-round
         # tool-result stubbing runs every round once context crosses the
@@ -176,6 +313,17 @@ class Settings:
         # turn BOUNDARY compaction; the overflow recovery's aggressive clear
         # is untouched and remains the backstop.
         self.compact_mid_turn_clear = os.environ.get("COMPACT_MID_TURN_CLEAR", "1") == "1"
+        # TOKEN DIET (ported from muji 2026-11-08): the lossless tool-result
+        # clear starts at CLEAR_AT and cuts to CLEAR_TO in ONE batch
+        # (hysteresis keeps a cached prompt prefix valid for many rounds);
+        # the newest KEEP_TOOL_RESULTS results always stay whole.
+        self.compact_clear_at = int(os.environ.get("COMPACT_CLEAR_AT", "40000"))
+        self.compact_clear_to = int(os.environ.get("COMPACT_CLEAR_TO", "25000"))
+        self.compact_keep_tool_results = int(os.environ.get("COMPACT_KEEP_TOOL_RESULTS", "6"))
+        # long-task brake: a wrap-up note at ROUND_WARN_AT rounds (then every
+        # ROUND_WARN_EVERY) — every round re-sends the whole conversation
+        self.round_warn_at = int(os.environ.get("ROUND_WARN_AT", "60"))
+        self.round_warn_every = int(os.environ.get("ROUND_WARN_EVERY", "30"))
         self.command_timeout = int(os.environ.get("COMMAND_TIMEOUT", "120"))
         self.approval_timeout = int(os.environ.get("APPROVAL_TIMEOUT", "180"))
         self.question_timeout = int(os.environ.get("QUESTION_TIMEOUT", "180"))
@@ -187,7 +335,7 @@ class Settings:
         # the model gets a preview + the file path (read_file / search_files)
         # instead of the full text — keeps big outputs (logs, greps) out of context.
         self.results_dir = self.data_dir / "results"
-        self.result_spill_threshold = int(os.environ.get("RESULT_SPILL_THRESHOLD", "6000"))
+        self.result_spill_threshold = int(os.environ.get("RESULT_SPILL_THRESHOLD", "2500"))
         # Local RAG (index_documents / local_search): chunk geometry and the
         # optional OpenAI-compatible embeddings model. Leave RAG_EMBED_MODEL
         # empty for BM25-only (zero config); set it to unlock dense/hybrid.
@@ -202,6 +350,122 @@ class Settings:
         self.instructions_archive_path = APP_ROOT / "INSTRUCTIONS-ARCHIVE.md"
         for d in (self.data_dir, self.uploads_dir, self.results_dir):
             d.mkdir(parents=True, exist_ok=True)
+
+        # apply the persisted active profile LAST (overrides the .env seeds)
+        self.set_profile(self.active_profile)
+
+    # ── model profiles ────────────────────────────────────────────────
+    def set_profile(self, name: str) -> str:
+        """Switch the active model profile in place (no restart); unknown
+        names fall back to "default". Persisted across restarts."""
+        if name not in self.profiles:
+            name = "default"
+        p = self.profiles[name]
+        self.active_profile = name
+        self.base_url = p["base_url"]
+        self.model = p["model"]
+        self.compact_boundary = int(p["compact_boundary"])
+        self.reasoning_effort_ok = bool(p.get("reasoning_effort", False))
+        self.thinking_style = p.get("thinking_style", "none")
+        self.vision = bool(p.get("vision", False))
+        self.profile_max_tokens = int(p.get("max_tokens") or 0)
+        self.compact_trigger = min(self._compact_trigger_env, int(self.compact_boundary * 0.75))
+        self.api_key = self.profile_key(name) or "sk-no-key"
+        _save_active_profile(name)
+        return name
+
+    def profile_key(self, name: str) -> str:
+        """API key for a profile: one saved from the UI (keychain
+        "profile_key:<name>") wins; "default" falls back to OPENAI_API_KEY /
+        keychain "api_key"; any Groq endpoint falls back to GROQ_API_KEY /
+        keychain "groq_api_key"."""
+        k = _keychain_secret("muji", "profile_key:" + name)
+        if k:
+            return k
+        if name == "default" and self._default_key != "sk-no-key":
+            return self._default_key
+        p = self.profiles.get(name) or {}
+        if "api.groq.com" in (p.get("base_url") or ""):
+            return self._groq_key
+        return ""
+
+    def effective_max_tokens(self) -> int:
+        caps = [c for c in (self.max_tokens, self.profile_max_tokens) if c > 0]
+        return min(caps) if caps else 0
+
+    def profile_public(self, name: str) -> dict:
+        """Profile view for the UI — never includes the key itself."""
+        p = self.profiles[name]
+        key = self.profile_key(name)
+        return {
+            "base_url": p["base_url"], "model": p["model"],
+            "compact_boundary": int(p["compact_boundary"]),
+            "reasoning_effort": bool(p.get("reasoning_effort", False)),
+            "thinking_style": p.get("thinking_style", "none"),
+            "vision": bool(p.get("vision", False)),
+            "max_tokens": int(p.get("max_tokens") or 0),
+            "builtin": name in BUILTIN_PROFILES,
+            "key_set": bool(key),
+            "key_hint": ("…" + key[-4:]) if len(key) >= 12 else ("set" if key else ""),
+        }
+
+    def upsert_profile(self, name: str, fields: dict, api_key: str | None,
+                       clear_key: bool = False) -> None:
+        """Create/update a profile ("default": only its key can change here —
+        its endpoint comes from .env). Blank api_key keeps the stored one."""
+        if not PROFILE_NAME_RE.match(name or ""):
+            raise ValueError("name must be 1-40 chars of a-z 0-9 . _ - (starting with a letter or digit)")
+        entry = None
+        if name not in BUILTIN_PROFILES:
+            base_url = (fields.get("base_url") or "").strip().rstrip("/")
+            model = (fields.get("model") or "").strip()
+            if not re.match(r"^https?://[^\s/]+", base_url):
+                raise ValueError("base URL must start with http:// or https://")
+            if not model:
+                raise ValueError("model is required")
+            try:
+                boundary = int(fields.get("compact_boundary") or 131072)
+            except (TypeError, ValueError):
+                raise ValueError("context limit must be a number")
+            if not 16384 <= boundary <= 10_000_000:
+                raise ValueError("context limit must be between 16,384 and 10,000,000")
+            if fields.get("thinking_style") not in (None, *THINKING_STYLES):
+                raise ValueError("thinking_style must be one of " + ", ".join(THINKING_STYLES))
+            entry = {"base_url": base_url, "model": model,
+                     "compact_boundary": boundary, **_compat_fields(fields)}
+        elif name not in self.profiles:
+            raise ValueError("unknown profile")
+        # key first: if the keychain write fails, nothing else changes
+        if clear_key:
+            _keychain_delete("muji", "profile_key:" + name)
+        elif api_key and api_key.strip():
+            _keychain_set("muji", "profile_key:" + name, api_key.strip())
+        if entry is not None:
+            custom = _load_custom_profiles()
+            custom[name] = entry
+            _save_custom_profiles(custom)
+            self.profiles[name] = entry
+        if name == self.active_profile:
+            self.set_profile(name)
+
+    def delete_profile(self, name: str) -> None:
+        if name in BUILTIN_PROFILES:
+            raise ValueError("built-in profiles can't be deleted")
+        if name not in self.profiles:
+            raise KeyError(name)
+        custom = _load_custom_profiles()
+        custom.pop(name, None)
+        _save_custom_profiles(custom)
+        self.profiles.pop(name, None)
+        _keychain_delete("muji", "profile_key:" + name)
+        if self.active_profile == name:
+            self.set_profile("default")
+
+    def embed_endpoint(self) -> tuple[str, str]:
+        """RAG embeddings stay on the "default" profile's endpoint, so
+        switching the chat model doesn't break local_search."""
+        p = self.profiles["default"]
+        return p["base_url"], self.profile_key("default") or "sk-no-key"
 
 
 settings = Settings()

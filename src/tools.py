@@ -9,6 +9,7 @@ import html as htmllib
 import json
 import os
 import re
+import subprocess
 import urllib.parse
 import uuid
 from html.parser import HTMLParser
@@ -26,7 +27,7 @@ MAX_READ = 100_000      # bytes readable in one read_file call
 MAX_WRITE = 500_000     # bytes writable in one write_file call
 MAX_OUTPUT = 20_000     # tool output cap fed back to the model
 MAX_SEARCH = 50         # default max search hits
-RESULT_PREVIEW = 2000   # chars of a spilled result shown inline (the rest is on disk)
+RESULT_PREVIEW = 800    # chars of a spilled result shown inline (the rest is on disk; was 2000 — token diet 2026-11-08)
 
 
 class ToolError(Exception):
@@ -712,7 +713,13 @@ DESTRUCTIVE = re.compile(
     # similar irreversible operations
     r"\btruncate(?=\s|$)|\bformat-volume\b|\bdiskpart\b|"
     r"git\s+clean\b|git\s+reset\s+--hard\b|git\s+push\s+(?:-f\b|--force\b)|"
-    r"shutil\.rmtree"
+    r"shutil\.rmtree|"
+    # credential-store writes/deletes (2026-11-08: the agent overwrote the
+    # git:https://github.com entry — the one EVERY git push uses — with
+    # placeholder text via `cmdkey /generic`, no approval asked)
+    r"\bcmdkey\b[^\n]*?/(?:add|generic|delete|pass)\b|"
+    r"git\s+credential(?:-manager)?\s+(?:approve|reject|store|erase)\b|"
+    r"\b(?:remove|new)-storedcredential\b"
     r")"
 )
 
@@ -760,10 +767,96 @@ def restart_command(command: str) -> tuple[bool, str]:
     return False, ""
 
 
+#: Secret shapes scrubbed from every command output before it reaches the
+#: model, the DB, the UI or the terminal log (2026-11-08: `git credential
+#: fill` printed the GitHub token in clear; it was stored, rendered, sent to
+#: the provider and pasted into ~30 commands).
+_SECRET_RES = [
+    re.compile(r"\b(gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"),
+    re.compile(r"\b(gsk_[A-Za-z0-9]{20,})"),                    # Groq
+    re.compile(r"\b(sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,})"),    # OpenAI / Anthropic
+    re.compile(r"\b(tvly-[A-Za-z0-9-]{16,})"),                  # Tavily
+    re.compile(r"\b(AKIA[0-9A-Z]{16})"),                        # AWS key id
+    re.compile(r"(?im)^(\s*password\s*=\s*)(\S+)"),             # git credential fill
+    re.compile(r"(https?://[^/\s:@]+:)([^@\s/]{8,})(@)"),       # https://user:token@host
+]
+_KNOWN_SECRETS: set[str] = set()
+
+
+def redact_secrets(text: str) -> str:
+    """Replace anything secret-shaped (and any secret muji itself injected)
+    with «redacted». Never raises."""
+    try:
+        for s in _KNOWN_SECRETS:
+            if s and s in text:
+                text = text.replace(s, "«redacted»")
+        for rx in _SECRET_RES:
+            if rx.groups >= 2:
+                text = rx.sub(lambda m: m.group(1) + "«redacted»" + (m.group(3) if rx.groups >= 3 else ""), text)
+            else:
+                text = rx.sub("«redacted»", text)
+    except Exception:  # noqa: BLE001
+        pass
+    return text
+
+
+_GH_TOKEN_CACHE: dict[str, str] = {}
+
+
+def _github_token() -> str:
+    """The GitHub token from Windows Credential Manager (via git's credential
+    helper) — fetched only when a command asks for $env:GITHUB_TOKEN, cached
+    for the process, registered for redaction. Never printed."""
+    if "t" in _GH_TOKEN_CACHE:
+        return _GH_TOKEN_CACHE["t"]
+    tok = ""
+    try:
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+        out = subprocess.run(["git", "credential", "fill"],
+                             input="protocol=https\nhost=github.com\n\n",
+                             capture_output=True, text=True, timeout=20, env=env).stdout
+        for line in out.splitlines():
+            if line.startswith("password="):
+                tok = line.split("=", 1)[1].strip()
+    except Exception:  # noqa: BLE001
+        tok = ""
+    if tok:
+        _KNOWN_SECRETS.add(tok)
+        _GH_TOKEN_CACHE["t"] = tok
+    return tok
+
+
+_NESTED_PS_RE = re.compile(
+    r"^\s*(?:powershell|pwsh)(?:\.exe)?\s+"
+    r"(?:-(?:NoProfile|NonInteractive|NoLogo)\s+|-ExecutionPolicy\s+\S+\s+)*"
+    r"-(?:Command|c)\s+(\"(?P<dq>.*)\"|'(?P<sq>.*)')\s*$", re.I | re.S)
+
+
+def unwrap_nested_powershell(command: str) -> str:
+    """run_command ALREADY runs in PowerShell. A model that wraps its command
+    in another `powershell -Command "…"` gets the OUTER shell expanding
+    `$vars` inside the double quotes to nothing before the inner one runs —
+    the 2026-11-08 session failed 25× on exactly that (`'=gho_…' is not
+    recognized`). Strip one redundant wrapper and run the inner script."""
+    m = _NESTED_PS_RE.match(command or "")
+    if not m:
+        return command
+    if m.group("dq") is not None:
+        return m.group("dq").replace('\\"', '"')
+    return m.group("sq").replace("''", "'")
+
+
 async def exec_command(command: str, cwd: Path | None = None) -> str:
-    """Run a command via PowerShell (only after policy/approval allowed it)."""
+    """Run a command via PowerShell (only after policy/approval allowed it).
+    Output is secret-scrubbed; $env:GITHUB_TOKEN / $env:GH_TOKEN are filled
+    from Credential Manager when the command references them."""
     env = dict(os.environ)
     env.setdefault("PYTHONIOENCODING", "utf-8")
+    command = unwrap_nested_powershell(command)
+    if re.search(r"\b(?:GITHUB_TOKEN|GH_TOKEN)\b", command):
+        tok = await asyncio.to_thread(_github_token)
+        if tok:
+            env["GITHUB_TOKEN"] = env["GH_TOKEN"] = tok
     try:
         proc = await asyncio.create_subprocess_exec(
             "powershell", "-NoProfile", "-NonInteractive", "-Command", command,
@@ -788,7 +881,7 @@ async def exec_command(command: str, cwd: Path | None = None) -> str:
     text = out.decode("utf-8", errors="replace")
     if len(text) > MAX_OUTPUT:
         text = text[:MAX_OUTPUT] + f"\n[truncated — {len(text)} chars total]"
-    text = text.strip() or "(no output)"
+    text = redact_secrets(text.strip()) or "(no output)"
     if proc.returncode != 0:
         text += f"\n[exit code {proc.returncode}]"
     return text
@@ -1520,7 +1613,7 @@ def t_note_fact(ctx: ToolCtx, fact: str) -> str:
         text = notes.read_text("utf-8", errors="replace")
     else:
         text = ("# task notes — this chat's durable memory\n"
-                "Re-injected into the system prompt every turn (last 4KB) — "
+                "Re-injected every turn (last 4KB) — "
                 "survives compaction, reload, restart, resume.\n\n"
                 "## Goal\n\n## Facts\n")
     if "## Facts" not in text:
@@ -1528,7 +1621,7 @@ def t_note_fact(ctx: ToolCtx, fact: str) -> str:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     notes.write_text(text + f"- {stamp} — {line}\n", encoding="utf-8")
     return (f"Saved to this chat's session notes ({notes}):\n{line}\n"
-            "It is re-injected into the system prompt every turn — it survives "
+            "It is re-injected every turn — it survives "
             "compaction, reload, restart, and resume. Never re-ask the boss for "
             "a fact that is already in the notes.")
 
@@ -1558,7 +1651,7 @@ TOOLS = [
                         "you an identifier you must not lose — an SSH address "
                         "or host, an IP/port, a credential, token, path, "
                         "connection string, key decision, or task state. The "
-                        "note is re-injected into the system prompt every "
+                        "note is re-injected every "
                         "turn, so it survives compaction, reload, restart, "
                         "and resume."),
         "params": {"fact": {"type": "string", "description": "The fact to save (one line, self-contained)"}},
@@ -1657,7 +1750,19 @@ TOOLS = [
                         "other session has in-flight work. Never use a raw "
                         "kill, restart-muji.ps1, start.bat, or `python "
                         "server.py` — those always ask. If you can't "
-                        "self-restart, say so in your final summary and stop."),
+                        "self-restart, say so in your final summary and stop. "
+                        "SHELL FACTS (Windows PowerShell 5.1): the command "
+                        "already runs IN PowerShell — never wrap it in "
+                        "`powershell -Command \"…\"`; `&&` is invalid (use `;`); "
+                        "`curl` is an alias of Invoke-WebRequest — use `curl.exe` "
+                        "or Invoke-RestMethod; for anything with nested "
+                        "quotes/JSON, write a .ps1 (or a JSON body file) with "
+                        "write_file and run that. SECRETS: the GitHub token is "
+                        "available as $env:GITHUB_TOKEN (filled from Credential "
+                        "Manager, never shown to you) — e.g. Invoke-RestMethod "
+                        "-Headers @{Authorization=\"Bearer $env:GITHUB_TOKEN\"} …; "
+                        "never print it, never put a token in a git remote URL "
+                        "(git authenticates by itself)."),
         "params": {
             "command": {"type": "string", "description": "The command line"},
             "cwd": {"type": "string", "description": "Working directory"},
@@ -1827,6 +1932,22 @@ TOOLS = [
         "required": ["chat"],
     },
     {
+        "name": "load_tools", "fn": None,  # agent handles (on-demand tool groups)
+        "description": ("Load an extra tool group for this chat; its tools are "
+                        "callable from your next step. Groups: telegram (search/"
+                        "read the user's Telegram), gmail (search/read Gmail), "
+                        "planner (shared task list + calendar events: tasks_*/"
+                        "events_*), math (verify_math), documents (local RAG: "
+                        "local_search, index_documents). Load only what the task "
+                        "needs; several groups at once is fine."),
+        "params": {
+            "groups": {"type": "array", "items": {"type": "string",
+                       "enum": ["telegram", "gmail", "planner", "math", "documents"]},
+                       "description": "Group names to load"},
+        },
+        "required": ["groups"],
+    },
+    {
         "name": "ask_user", "fn": None,  # agent handles (question flow)
         "description": ("Ask the boss a multiple-choice question when part of the "
                         "instruction is genuinely vague AND the choice materially changes "
@@ -1880,6 +2001,66 @@ def category_of(tool_name: str) -> str | None:
         if tool_name in tools:
             return cat
     return None
+
+
+#: Tools loaded ON DEMAND (token diet 2026-11-08). Each group was used in
+#: <0.2% of all historical tool calls yet its schemas rode on EVERY request
+#: (~1.9k tokens total). They stay out of the request until the model calls
+#: load_tools(group); a loaded group then stays on for the rest of the chat.
+OPTIONAL_TOOL_GROUPS: dict[str, tuple[list[str], str]] = {
+    "telegram": (["tg_search", "tg_read", "tg_topics"],
+                 "search/read the user's Telegram chats and forum topics"),
+    "gmail": (["gmail_search", "gmail_read"], "search/read the user's Gmail"),
+    "planner": (["tasks_list", "tasks_add", "tasks_done",
+                 "events_list", "events_add", "events_done"],
+                "the shared task list (\"our tasks\") and calendar events"),
+    "math": (["verify_math"], "symbolic/numeric math verification (SymPy)"),
+    "documents": (["local_search", "index_documents"],
+                  "local RAG: index folders and semantic-search documents"),
+}
+
+
+def _filter_optional_groups() -> None:
+    """Public build: keep only tools that exist in this registry AND aren't
+    switched off by TOOLS_DISABLED (personal integrations are off by
+    default), drop empty groups, and rewrite load_tools' description/enum
+    to match — so the model is never offered a group with nothing in it."""
+    global OPTIONAL_TOOL_GROUPS
+    active = {t["name"] for t in TOOLS if t["name"] not in settings.tools_disabled}
+    OPTIONAL_TOOL_GROUPS = {
+        g: ([n for n in names if n in active], desc)
+        for g, (names, desc) in OPTIONAL_TOOL_GROUPS.items()
+        if any(n in active for n in names)}
+    spec = next((t for t in TOOLS if t["name"] == "load_tools"), None)
+    if spec is None:
+        return
+    if not OPTIONAL_TOOL_GROUPS:
+        TOOLS.remove(spec)  # nothing optional is enabled → no meta-tool
+        return
+    spec["description"] = (
+        "Load an extra tool group for this chat; its tools are callable from "
+        "your next step. Groups: " + "; ".join(
+            f"{g} ({desc}: {', '.join(names)})"
+            for g, (names, desc) in OPTIONAL_TOOL_GROUPS.items())
+        + ". Load only what the task needs; several groups at once is fine.")
+    spec["params"]["groups"]["items"]["enum"] = list(OPTIONAL_TOOL_GROUPS)
+
+
+_filter_optional_groups()
+
+
+def optional_tool_names() -> set[str]:
+    return {n for names, _ in OPTIONAL_TOOL_GROUPS.values() for n in names}
+
+
+def schema_exclude(loaded_groups: set[str] | None = None,
+                   extra: set[str] | None = None) -> set[str]:
+    """Tool names to leave out of the request: every optional tool whose
+    group isn't loaded, plus `extra` (e.g. MUTATING_TOOLS in Plan mode)."""
+    loaded = loaded_groups or set()
+    out = {n for g, (names, _) in OPTIONAL_TOOL_GROUPS.items()
+           if g not in loaded for n in names}
+    return out | (extra or set())
 
 
 def openai_schemas(exclude: set[str] | None = None) -> list[dict]:

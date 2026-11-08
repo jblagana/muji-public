@@ -126,7 +126,7 @@
     tzDrawer: $("tz-drawer"), tzHead: $("tz-head"), tzTitle: $("tz-title"),
     tzCount: $("tz-count"), tzBody: $("tz-body"),
     tzTab: $("tz-tab"), tzClose: $("tz-close"),
-    sessionList: $("session-list"), rootLine: $("root-line"), modelLine: $("model-line"), restartServer: $("restart-server"),
+    sessionList: $("session-list"), rootLine: $("root-line"), modelLine: $("model-line"), modelProfile: $("model-profile"), restartServer: $("restart-server"),
     topbarTitle: $("topbar-title"), previewToggle: $("preview-toggle"),
     ctxMeter: $("ctx-meter"), ctxFill: $("ctx-fill"), ctxPct: $("ctx-pct"),
     toks: $("toks"), toksVal: $("toks-val"),
@@ -6869,6 +6869,7 @@
     el.input.placeholder = "Message " + (config.brand || "muji") + "…";
     el.rootLine.textContent = "root: " + config.root_dir;
     el.modelLine.textContent = "model: " + (config.model || "?");
+    renderModelProfile(config);
     el.aaSub.textContent =
       "Let " + (config.brand || "muji") + " take these actions without asking for approval:";
     await loadSettings();
@@ -7544,6 +7545,451 @@ el.rpTreeReveal.addEventListener("click", () => {
       Object.assign(state.autoApprove, data.auto_approve || {});
     } catch (e) { /* keep defaults */ }
     renderAutoApprove();
+  }
+
+  // --- Model profile switcher (2026-10-23) + profiles panel (2026-11-08) ---
+  // /api/model → {profiles: {name: {base_url, model, compact_boundary,
+  // reasoning_effort, builtin, key_set, key_hint}}, active}. The dropdown
+  // in the bottom bar switches live (no restart, persists across boots);
+  // its last entry opens the "Model profiles" panel where any
+  // OpenAI-compatible provider (Groq, OpenAI, OpenRouter, …) can be added
+  // with its own key. Keys are write-only: the server stores them in the
+  // OS keychain and only ever reports key_set + a last-4 hint.
+  const MANAGE_PROFILES = "__manage__";
+  const PROVIDER_PRESETS = [
+    // style = how "thinking" is requested (see config.THINKING_STYLES);
+    // most hosted non-reasoning models 400 on reasoning params → "none"
+    // model "" everywhere: the model is picked from the provider's live list
+    // (loaded as soon as a key is entered); ctx/style/vision/maxTok are only
+    // the provider-level fallbacks until a model is chosen
+    { id: "groq", label: "Groq", base_url: "https://api.groq.com/openai/v1", model: "", ctx: 131072, style: "none", vision: false, maxTok: 16384 },
+    { id: "openai", label: "OpenAI", base_url: "https://api.openai.com/v1", model: "", ctx: 128000, style: "none", vision: false, maxTok: 16384 },
+    { id: "openrouter", label: "OpenRouter", base_url: "https://openrouter.ai/api/v1", model: "", ctx: 131072, style: "none", vision: false, maxTok: 16384 },
+    { id: "together", label: "Together", base_url: "https://api.together.xyz/v1", model: "", ctx: 131072, style: "none", vision: false, maxTok: 16384 },
+    { id: "vllm", label: "vLLM / Qwen (self-hosted)", base_url: "http://", model: "", ctx: 262144, style: "qwen", vision: true, maxTok: 0 },
+    { id: "custom", label: "Custom (OpenAI-compatible)", base_url: "", model: "", ctx: 131072, style: "none", vision: false, maxTok: 16384 },
+  ];
+
+  let _toastTimer = null;
+  function toast(msg, ms) {
+    const old = document.querySelector(".wait-toast.mp-toast");
+    if (old) old.remove();
+    if (_toastTimer) { clearTimeout(_toastTimer); _toastTimer = null; }
+    const b = document.createElement("div");
+    b.className = "wait-toast mp-toast";
+    b.textContent = msg;
+    document.body.appendChild(b);
+    _toastTimer = setTimeout(() => { b.remove(); _toastTimer = null; }, ms || 3000);
+  }
+
+  function profileLabel(n, p) {
+    const short = (p.model || n).split("/").pop() || n;
+    return (n === "default" ? short + " (default)" : short) + (p.key_set ? "" : " (no key)");
+  }
+
+  function setModelLine(p) {
+    if (!p || !el.modelLine) return;
+    el.modelLine.textContent = "model: " + (p.model || "?").split("/").pop();
+    el.modelLine.title = p.model + " · " + p.base_url;
+  }
+
+  async function renderModelProfile(cfg, data) {
+    const sel = el.modelProfile;
+    if (!sel) return;
+    if (!data) {
+      try { data = await (await api("/api/model")).json(); }
+      catch (e) { sel.style.display = "none"; return; }
+    }
+    const names = Object.keys(data.profiles || {});
+    if (!names.length) { sel.style.display = "none"; return; }
+    sel.style.display = "";
+    sel.innerHTML = "";
+    for (const n of names) {
+      const p = data.profiles[n];
+      const opt = document.createElement("option");
+      opt.value = n;
+      opt.textContent = profileLabel(n, p);
+      opt.title = n + " · " + p.model + " · " + p.base_url;
+      sel.appendChild(opt);
+    }
+    const mg = document.createElement("option");
+    mg.value = MANAGE_PROFILES;
+    mg.textContent = "⚙ Manage profiles…";
+    sel.appendChild(mg);
+    sel.value = data.active || names[0];
+    sel._active = sel.value;
+    const ap = data.profiles[data.active];
+    setModelLine(ap);
+    if (ap && state.config) {  // keep the context meter's 100% mark in sync
+      state.config.model = ap.model;
+      state.config.compact_boundary = ap.compact_boundary;
+      state.config.active_profile = data.active;
+    }
+    if (sel._wired) return;
+    sel._wired = true;
+    sel.addEventListener("change", async () => {
+      const name = sel.value;
+      if (name === MANAGE_PROFILES) {
+        sel.value = sel._active;
+        openModelProfilesModal();
+        return;
+      }
+      await switchModel(name);
+    });
+  }
+
+  async function switchModel(name) {
+    const sel = el.modelProfile;
+    try {
+      const r = await (await api("/api/model", {
+        method: "POST", body: JSON.stringify({ profile: name }),
+      })).json();
+      if (!r.ok) throw new Error("switch failed");
+      await renderModelProfile(state.config, { profiles: r.profiles, active: r.active });
+      if (r.active !== name) toast("unknown profile — fell back to " + r.active, 4000);
+      else if (!r.key_set && name !== "hpc") {
+        toast("“" + name + "” has no API key — add one in ⚙ Manage profiles…", 6000);
+      } else toast("model: " + name, 2500);
+    } catch (e) {
+      toast("model switch failed: " + e.message, 4000);
+      if (sel) renderModelProfile(state.config);
+    }
+  }
+
+  async function modelApiJson(res) {
+    let d = null;
+    try { d = await res.json(); } catch (e) { /* non-JSON */ }
+    if (!res.ok) throw new Error((d && d.detail) || ("HTTP " + res.status));
+    return d;
+  }
+
+  function openModelProfilesModal() {
+    const overlay = document.createElement("div");
+    overlay.className = "tz-edit-ovl";
+    const box = document.createElement("div");
+    box.className = "tz-edit mp-modal";
+    overlay.appendChild(box);
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) overlay.remove(); });
+    const onKey = (e) => { if (e.key === "Escape") { overlay.remove(); document.removeEventListener("keydown", onKey); } };
+    document.addEventListener("keydown", onKey);
+    document.body.appendChild(overlay);
+
+    let data = null;
+    const mk = (tag, cls, text) => {
+      const n = document.createElement(tag);
+      if (cls) n.className = cls;
+      if (text !== undefined) n.textContent = text;
+      return n;
+    };
+
+    async function reload(d) {
+      data = d || await modelApiJson(await api("/api/model"));
+      renderModelProfile(state.config, data);
+    }
+
+    function showList() {
+      box.innerHTML = "";
+      box.appendChild(mk("div", "tz-edit-h", "Model profiles"));
+      const list = mk("div", "mp-list");
+      for (const n of Object.keys(data.profiles)) {
+        const p = data.profiles[n];
+        const row = mk("div", "mp-row" + (n === data.active ? " active" : ""));
+        const info = mk("div", "mp-info");
+        const top = mk("div", "mp-name", n);
+        if (n === data.active) top.appendChild(mk("span", "mp-badge on", "active"));
+        if (p.builtin) top.appendChild(mk("span", "mp-badge", "built-in"));
+        top.appendChild(mk("span", "mp-badge " + (p.key_set ? "ok" : "warn"),
+          p.key_set ? "key " + p.key_hint : "no key"));
+        info.appendChild(top);
+        info.appendChild(mk("div", "mp-sub", p.model + " · " + p.base_url));
+        info.appendChild(mk("div", "mp-sub", "ctx " + Math.round(p.compact_boundary / 1024) + "k · reasoning: " +
+          (p.thinking_style || "none") + " · " + (p.vision ? "vision" : "text-only") +
+          (p.max_tokens ? " · max out " + p.max_tokens : "")));
+        row.appendChild(info);
+        const acts = mk("div", "mp-acts");
+        if (n !== data.active) {
+          const use = mk("button", "mini-btn", "Use");
+          use.type = "button";
+          use.addEventListener("click", async () => {
+            await switchModel(n);
+            await reload();
+            showList();
+          });
+          acts.appendChild(use);
+        }
+        const edit = mk("button", "mini-btn", p.builtin ? "Key" : "Edit");
+        edit.type = "button";
+        edit.addEventListener("click", () => showEditor(n));
+        acts.appendChild(edit);
+        if (!p.builtin) {
+          const del = mk("button", "mini-btn danger", "✕");
+          del.type = "button";
+          del.title = "Delete this profile and its stored key";
+          del.addEventListener("click", async () => {
+            if (!confirm("Delete profile “" + n + "” and its stored API key?")) return;
+            try {
+              await reload(await modelApiJson(await api("/api/model/profiles/" + encodeURIComponent(n), { method: "DELETE" })));
+              showList();
+            } catch (e) { toast("delete failed: " + e.message, 4000); }
+          });
+          acts.appendChild(del);
+        }
+        row.appendChild(acts);
+        list.appendChild(row);
+      }
+      box.appendChild(list);
+      box.appendChild(mk("div", "mp-note",
+        "API keys are stored in the Windows Credential Manager (service “muji”), never in a file, and are never sent back to the browser."));
+      const actions = mk("div", "tz-e-actions");
+      const close = mk("button", "tz-e-cancel", "Close");
+      close.type = "button";
+      close.addEventListener("click", () => overlay.remove());
+      const add = mk("button", "tz-e-save", "+ Add profile");
+      add.type = "button";
+      add.addEventListener("click", () => showEditor(null));
+      actions.append(close, add);
+      box.appendChild(actions);
+    }
+
+    function field(label, input, hint) {
+      const w = mk("label", "mp-field");
+      w.appendChild(mk("span", "mp-lbl", label));
+      w.appendChild(input);
+      if (hint) w.appendChild(mk("span", "mp-hint", hint));
+      return w;
+    }
+
+    function showEditor(name) {
+      const existing = name ? data.profiles[name] : null;
+      const builtin = !!(existing && existing.builtin);
+      box.innerHTML = "";
+      box.appendChild(mk("div", "tz-edit-h", name ? (builtin ? "API key — " + name : "Edit profile — " + name) : "Add model profile"));
+
+      const fProvider = mk("select", "mp-select");
+      for (const pr of PROVIDER_PRESETS) {
+        const o = mk("option", null, pr.label);
+        o.value = pr.id;
+        fProvider.appendChild(o);
+      }
+      const fName = mk("input"); fName.placeholder = "filled in when you pick a model"; fName.spellcheck = false;
+      const fUrl = mk("input"); fUrl.placeholder = "https://api.example.com/v1"; fUrl.spellcheck = false;
+      const fModel = mk("input"); fModel.spellcheck = false; fModel.autocomplete = "off";
+      fModel.placeholder = "none yet — enter the API key to load this provider's models";
+      const dl = mk("datalist"); dl.id = "mp-models-" + Date.now();
+      fModel.setAttribute("list", dl.id);
+      const fCtx = mk("input"); fCtx.type = "number"; fCtx.min = "1024"; fCtx.step = "1024";
+      const fStyle = mk("select", "mp-select");
+      for (const [v, t] of [["none", "None — don't send reasoning params (safest)"],
+                            ["openai", "OpenAI-style reasoning_effort low|medium|high (gpt-oss, o-series)"],
+                            ["qwen_hosted", "Hosted Qwen3 (Groq): low|medium|high, off = none"],
+                            ["qwen", "Qwen on vLLM (reasoning_effort + chat_template_kwargs)"]]) {
+        const o = mk("option", null, t); o.value = v; fStyle.appendChild(o);
+      }
+      const fVision = mk("input"); fVision.type = "checkbox";
+      const fMaxTok = mk("input"); fMaxTok.type = "number"; fMaxTok.min = "0"; fMaxTok.step = "1024";
+      fMaxTok.placeholder = "0 = muji default (MAX_TOKENS)";
+      const fKey = mk("input"); fKey.type = "password"; fKey.autocomplete = "off"; fKey.spellcheck = false;
+      fKey.placeholder = existing && existing.key_set ? "saved (" + existing.key_hint + ") — leave blank to keep" : "paste API key";
+      const fClear = mk("input"); fClear.type = "checkbox";
+
+      if (existing) {
+        fName.value = name; fName.disabled = true;
+        fUrl.value = existing.base_url; fModel.value = existing.model;
+        fCtx.value = existing.compact_boundary;
+        fStyle.value = existing.thinking_style || (existing.reasoning_effort ? "openai" : "none");
+        fVision.checked = !!existing.vision;
+        fMaxTok.value = existing.max_tokens || 0;
+        const match = PROVIDER_PRESETS.find((pr) => pr.base_url && existing.base_url.startsWith(pr.base_url));
+        fProvider.value = match ? match.id : "custom";
+      } else {
+        fProvider.value = "groq";
+      }
+      // ── live model list: loaded from the provider as soon as there is a
+      // key (typed, or already saved for this profile); picking a model
+      // pre-fills context / max output / vision / reasoning style + name ──
+      let modelMeta = {};
+      let loadedFor = "";
+      let loadTimer = null;
+      const slug = (id) => (id || "").split("/").pop().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").slice(0, 28);
+      const hasKey = () => !!fKey.value.trim() || !!(existing && existing.key_set);
+      const keyless = () => ["vllm", "custom"].includes(fProvider.value);
+      const inferModel = (id) => {
+        // name-based guesses — only used where the provider's list is silent
+        const s = (id || "").toLowerCase();
+        const prov = fProvider.value;
+        let style = "none";
+        if (s.includes("gpt-oss") || /(^|\/)o[134](-|$)|gpt-5/.test(s)) style = "openai";
+        else if (/qwen3|qwq/.test(s)) style = prov === "groq" ? "qwen_hosted" : prov === "vllm" ? "qwen" : "none";
+        const vision = /vision|-vl|vl-|gpt-4o|gpt-4\.1|gpt-5|llama-4|gemini|claude|pixtral|qwen3\.[5-9]|qwen2\.5-vl/.test(s);
+        return { style, vision };
+      };
+      const applyModel = (id) => {
+        if (!id || fName.disabled && existing && id === existing.model) return;
+        const pr = PROVIDER_PRESETS.find((x) => x.id === fProvider.value) || {};
+        const meta = modelMeta[id] || {};
+        const guess = inferModel(id);
+        fCtx.value = meta.context_window || pr.ctx || 131072;
+        fMaxTok.value = meta.max_output || pr.maxTok || 0;
+        fVision.checked = meta.vision === true || meta.vision === false ? meta.vision : guess.vision;
+        fStyle.value = guess.style;
+        if (!fName.disabled && !fName.dataset.touched) {
+          fName.value = (fProvider.value === "custom" ? "" : fProvider.value + "-") + slug(id);
+        }
+        const from = [];
+        if (meta.context_window) from.push("context " + Math.round(meta.context_window / 1024) + "k");
+        if (meta.max_output) from.push("max output " + meta.max_output);
+        if (meta.vision != null) from.push(meta.vision ? "vision" : "text-only");
+        status.className = "mp-status ok";
+        status.textContent = "“" + id + "” — " + (from.length ? "from the provider: " + from.join(", ") + "; " : "") +
+          "reasoning + " + (meta.vision != null ? "" : "vision ") + "guessed from the name — adjust if needed";
+      };
+      const loadModels = async (force) => {
+        const url = fUrl.value.trim();
+        if (!/^https?:\/\/[^\s/]+/.test(url)) return;
+        if (!hasKey() && !keyless()) {
+          status.className = "mp-status"; status.textContent = "Enter the API key to load the model list.";
+          return;
+        }
+        const sig = url + "|" + fKey.value.trim();
+        if (!force && sig === loadedFor) return;
+        status.className = "mp-status"; status.textContent = "Loading models…";
+        try {
+          const r = await modelApiJson(await api("/api/model/test", {
+            method: "POST",
+            body: JSON.stringify({ name: name || "", base_url: url, api_key: fKey.value.trim() }),
+          }));
+          if (!r.ok) {
+            loadedFor = "";
+            status.className = "mp-status bad"; status.textContent = "✕ " + r.error;
+            return;
+          }
+          loadedFor = sig;
+          modelMeta = r.meta || {};
+          dl.innerHTML = "";
+          for (const id of r.models || []) {
+            const o = mk("option"); o.value = id;
+            const m = modelMeta[id] || {};
+            const bits = [];
+            if (m.context_window) bits.push(Math.round(m.context_window / 1024) + "k ctx");
+            if (m.vision) bits.push("vision");
+            if (bits.length) o.label = bits.join(" · ");
+            dl.appendChild(o);
+          }
+          fModel.placeholder = (r.models || []).length
+            ? "type to search " + r.models.length + " models…" : "no models listed — type the model id";
+          status.className = "mp-status ok";
+          status.textContent = "✓ key works — " + (r.models || []).length + " models available. Click the Model field to pick one.";
+          if (!fModel.value) fModel.focus();
+        } catch (e) {
+          loadedFor = "";
+          status.className = "mp-status bad"; status.textContent = "✕ " + e.message;
+        }
+      };
+      const scheduleLoad = (ms) => { clearTimeout(loadTimer); loadTimer = setTimeout(() => loadModels(false), ms); };
+      const applyPreset = () => {
+        const pr = PROVIDER_PRESETS.find((x) => x.id === fProvider.value);
+        if (!pr) return;
+        fUrl.value = pr.base_url;
+        fModel.value = ""; modelMeta = {}; dl.innerHTML = ""; loadedFor = "";
+        fModel.placeholder = "none yet — enter the API key to load this provider's models";
+        fCtx.value = pr.ctx; fStyle.value = pr.style; fVision.checked = pr.vision; fMaxTok.value = pr.maxTok;
+        if (!fName.disabled && !fName.dataset.touched) fName.value = "";
+        scheduleLoad(150);
+      };
+      fName.addEventListener("input", () => { fName.dataset.touched = "1"; });
+      fModel.addEventListener("input", () => {
+        const id = fModel.value.trim();
+        if (modelMeta[id]) applyModel(id);               // picked from the list
+        else if (!fName.disabled && !fName.dataset.touched && id) {
+          fName.value = (fProvider.value === "custom" ? "" : fProvider.value + "-") + slug(id);
+        }
+      });
+      fModel.addEventListener("change", () => { const id = fModel.value.trim(); if (id) applyModel(id); });
+      fKey.addEventListener("input", () => { if (fKey.value.trim().length >= 8) scheduleLoad(600); });
+      fKey.addEventListener("paste", () => scheduleLoad(80));
+      fUrl.addEventListener("change", () => scheduleLoad(50));
+      fProvider.addEventListener("change", applyPreset);
+      if (!existing) applyPreset();
+      else if (existing.key_set || keyless()) scheduleLoad(100);  // edit: offer the list right away
+
+      if (!builtin) {
+        box.appendChild(field("Provider", fProvider));
+        box.appendChild(field("Base URL", fUrl, "OpenAI-compatible endpoint (…/v1)"));
+        box.appendChild(field("API key", fKey, "stored in Windows Credential Manager — the model list loads as soon as it's entered"));
+        box.appendChild(field("Model", fModel));
+        box.appendChild(dl);
+        box.appendChild(field("Profile name", fName));
+        box.appendChild(field("Context limit (tokens)", fCtx, "the model's window — compaction fires at 75% of it"));
+        box.appendChild(field("Max output tokens", fMaxTok, "the provider's per-request completion cap (Groq: 32768 on most models)"));
+        box.appendChild(field("Reasoning parameters", fStyle,
+          "muji's default is tuned for Qwen/vLLM; other providers reject params they don't know"));
+        const viW = mk("label", "mp-check");
+        viW.append(fVision, mk("span", null, "Model accepts images (vision) — off: attachments/screenshots are sent as a text note instead"));
+        box.appendChild(viW);
+      } else {
+        box.appendChild(mk("div", "mp-sub", existing.model + " · " + existing.base_url));
+        box.appendChild(field("API key", fKey));
+      }
+      if (existing && existing.key_set) {
+        const clW = mk("label", "mp-check");
+        clW.append(fClear, mk("span", null, "Remove the key saved from this panel"));
+        box.appendChild(clW);
+      }
+
+      const status = mk("div", "mp-status");
+      const err = mk("div", "tz-e-err");
+      box.append(status, err);
+
+      const actions = mk("div", "tz-e-actions");
+      const back = mk("button", "tz-e-cancel", "Back");
+      back.type = "button";
+      back.addEventListener("click", showList);
+      const test = mk("button", "tz-e-cancel", "Reload models");
+      test.type = "button";
+      test.title = "Re-check the endpoint + key and reload the model list";
+      test.addEventListener("click", async () => {
+        err.textContent = "";
+        test.disabled = true;
+        try { await loadModels(true); } finally { test.disabled = false; }
+      });
+      const save = mk("button", "tz-e-save", "Save");
+      save.type = "button";
+      save.addEventListener("click", async () => {
+        err.textContent = "";
+        const pname = (name || fName.value).trim().toLowerCase();
+        if (!pname) { err.textContent = "profile name is required"; return; }
+        if (!name && data.profiles[pname]) { err.textContent = "a profile named “" + pname + "” already exists"; return; }
+        save.disabled = true;
+        try {
+          const body = {
+            base_url: fUrl.value.trim(), model: fModel.value.trim(),
+            compact_boundary: parseInt(fCtx.value, 10) || 131072,
+            thinking_style: fStyle.value,
+            vision: fVision.checked,
+            max_tokens: parseInt(fMaxTok.value, 10) || 0,
+          };
+          if (fKey.value.trim()) body.api_key = fKey.value.trim();
+          if (fClear.checked) body.clear_key = true;
+          const d = await modelApiJson(await api("/api/model/profiles/" + encodeURIComponent(pname), {
+            method: "PUT", body: JSON.stringify(body),
+          }));
+          fKey.value = "";
+          await reload(d);
+          toast("saved profile “" + pname + "”", 2500);
+          showList();
+        } catch (e) {
+          err.textContent = e.message;
+        } finally { save.disabled = false; }
+      });
+      actions.append(back, test, save);
+      box.appendChild(actions);
+      (builtin ? fKey : (existing ? fModel : fProvider)).focus();
+    }
+
+    reload().then(showList).catch((e) => {
+      box.innerHTML = "";
+      box.appendChild(mk("div", "tz-e-err", "couldn't load profiles: " + e.message));
+    });
   }
 
   async function saveAutoApprove(cat, value) {

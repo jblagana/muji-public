@@ -14,7 +14,7 @@
   <link rel="stylesheet" href="/static/vendor/hljs-github.min.css" media="(prefers-color-scheme: light)" id="hljs-light"/>
   <link rel="stylesheet" href="/static/vendor/hljs-github-dark.min.css" media="(prefers-color-scheme: dark)" id="hljs-dark"/>
   <link rel="stylesheet" href="/static/vendor/katex.min.css"/>
-  <link rel="stylesheet" href="/static/style.css?v=172"/>
+  <link rel="stylesheet" href="/static/style.css?v=173"/>
 </head>
 <body>
 <!-- Icon sprite (2026-10-05): one stroke family for the whole UI — Lucide-style
@@ -150,7 +150,7 @@
     </div>
     <div class="sidebar-foot">
       <div class="meta-line" id="root-line" title="Agent file root"></div>
-      <div class="meta-line" id="model-line" title="Model endpoint"></div>
+      <select id="model-profile" class="mini-btn model-profile" title="Model profile — switches the LLM in place, no restart"></select><div class="meta-line" id="model-line" title="Model endpoint"></div>
       <button class="mini-btn" id="restart-server" title="Restart the server to load the latest code" style="width:100%;margin-top:6px">⟳&nbsp; Restart server</button>
     </div>
   </aside>
@@ -469,6 +469,6 @@
 <script src="/static/vendor/purify.min.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
 <script src="/static/vendor/katex.min.js"></script>
-<script src="/static/app.js?v=191"></script>
+<script src="/static/app.js?v=193"></script>
 </body>
 </html>

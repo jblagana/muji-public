@@ -19,13 +19,17 @@ import uuid
 
 from . import db
 from .config import settings
-from .llm import LLM, LLMError, ToolUnsupported, is_transient_message
+from .llm import LLM, LLMError, ToolCallFailed, ToolUnsupported, is_transient_message
 from .sse import get_stopper, sse
 from .tools import (NeedsScope, ToolCtx, ToolError, destructive_command,
                     dispatch, exec_command, openai_schemas, restart_command,
-                    spill_result, tool_summary)
+                    spill_result, tool_summary, schema_exclude,
+                    OPTIONAL_TOOL_GROUPS)
 
 approvals: dict[str, asyncio.Future] = {}   # approval_id → future
+#: optional tool groups a chat has loaded via load_tools (session_id → groups);
+#: in-memory, so a restart starts lean again (the model just re-loads)
+_loaded_tool_groups: dict[str, set[str]] = {}
 questions: dict[str, asyncio.Future] = {}   # question_id → future (index of choice)
 session_sources: dict[str, list[str]] = {}  # session_id → grounding text
 
@@ -171,6 +175,25 @@ def _workspace_block() -> str:
 #: brace here would crash the server at import. No braces allowed in this text.
 TASK_RULES = (
     "\n\nHARD RULES — task lifecycle (ratified by the user, non-negotiable):\n"
+    "- Secrets: NEVER ask the user to paste a token/password/key into the "
+    "chat (it is stored in history and sent to the model provider). Secrets "
+    "live in Windows Credential Manager and you never need to see them: git "
+    "push/clone authenticates by itself, and for GitHub API calls run_command "
+    "provides $env:GITHUB_TOKEN (e.g. Invoke-RestMethod -Method Post -Uri "
+    "https://api.github.com/user/repos -Headers @{Authorization=\"Bearer "
+    "$env:GITHUB_TOKEN\"} -Body (@{name='x'} | ConvertTo-Json)). Never run "
+    "`git credential fill`, never print a token, never embed one in a remote "
+    "URL or a file.\n"
+    "- Live links: before you report a URL as live/deployed, open it "
+    "(fetch_url, or Invoke-WebRequest -Method Head) and confirm it answers "
+    "200 — GitHub Pages can take 1–2 minutes after the first push, so retry "
+    "a few times. Write URLs with plain ASCII hyphens. If it never comes up, "
+    "say so instead of claiming it's live. Don't commit scratch files "
+    "(request bodies, logs) into a repo you publish.\n"
+    "- Rounds cost tokens: every model round re-sends the whole conversation. "
+    "Issue INDEPENDENT tool calls together in one round (read several files, "
+    "run several checks at once); read only the lines you need (start_line/"
+    "end_line, search_files) instead of whole files.\n"
     "- TL;DR: every FINAL summary AND every multi-paragraph reply ends with a "
     "one-line **TL;DR** (after the details, before any Chips section). Short "
     "mid-task replies (findings, status, questions, plans) and one-line "
@@ -363,17 +386,59 @@ def _session_notes_block(session_id: str) -> str:
             "When the boss hands you an identifier you must not lose "
             "(SSH address/host, IP:port, credential, token, path, connection "
             "string), a key decision, or task state, call note_fact(fact) — "
-            "it creates the file and it is re-injected into the system "
-            "prompt every turn from then on.")
+            "it creates the file and it is re-injected every turn "
+            "from then on.")
+
+
+def _model_identity_block() -> str:
+    """Which LLM is actually answering (ported 2026-11-08): models don't know
+    their own name — gpt-oss-120b on Groq claimed to be "gpt-4o-mini".
+    Rebuilt every turn, so an in-UI profile switch shows on the next message."""
+    host = re.sub(r"^https?://([^/:]+).*$", r"\1", settings.base_url or "")
+    return (f"\n\nModel: this turn runs on `{settings.model}` (muji profile "
+            f"`{settings.active_profile}`, served by {host or 'unknown host'}). "
+            "If asked which model/LLM you are, answer with exactly that — "
+            "never guess from your training data.\n")
+
+
+def volatile_context(session_id: str, recall: str = "") -> str:
+    """Per-turn VOLATILE prompt material (session notes + recalled past
+    tasks). Token diet / prompt caching: inside the system prompt every
+    change invalidated the provider's cached prefix for the WHOLE
+    conversation after it; run_chat attaches this to the current turn's
+    user message instead, keeping the system prompt byte-stable."""
+    ctx = _session_notes_block(session_id) if session_id else ""
+    if recall:
+        ctx += _recall_block(recall)
+    return ctx.strip()
+
+
+def _attach_volatile(messages: list[dict], ctx: str) -> None:
+    """Prepend the volatile context to the LAST user message (this turn's)."""
+    if not ctx:
+        return
+    block = "[turn context — session notes / recall]\n" + ctx + "\n[/turn context]\n\n"
+    for m in reversed(messages):
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            m["content"] = block + c
+        elif isinstance(c, list):
+            m["content"] = [{"type": "text", "text": block.rstrip()}] + c
+        return
 
 
 def build_system(cwd: pathlib.Path, text_mode: bool, plan_mode: bool = False,
                  roast: str = "chill", recall: str = "",
-                 session_id: str = "") -> str:
+                 session_id: str = "", volatile: bool = True) -> str:
+    """volatile=False leaves out session notes + recall (run_chat attaches
+    them to the user message — see volatile_context)."""
     p = BASE_PROMPT.format(brand=settings.brand,
                            creator=settings.creator,
                            date=datetime.date.today().isoformat(),
                            cwd=cwd, root=settings.root_dir)
+    p += _model_identity_block()
     p += TASK_RULES
     _instructions_auto_split()  # housekeeping at prompt-build time; never raises
     p += _muji_files_block()
@@ -381,9 +446,10 @@ def build_system(cwd: pathlib.Path, text_mode: bool, plan_mode: bool = False,
     p += _designer_profile()
     p += _learned_block()
     p += _tool_notes_block()
-    p += _session_notes_block(session_id)
-    if recall:
-        p += _recall_block(recall)
+    if volatile:
+        p += _session_notes_block(session_id)
+        if recall:
+            p += _recall_block(recall)
     if text_mode:
         p += TEXT_TOOL_PROTOCOL.format(
             tool_list=tool_summary(exclude=MUTATING_TOOLS if plan_mode else None))
@@ -711,7 +777,7 @@ async def _log_trajectory(session_id: str, goal: str, answer: str,
     row (the raw material for recall + learned.md). Never raises — memory
     must not break or delay the user's turn."""
     try:
-        verified, pattern, toolnote = await _trajectory_audit(answer, tool_names)
+        verified, pattern, toolnote = await _trajectory_audit(answer, tool_names, goal)
         if pattern:
             _learned_append_pending(pattern)
         if toolnote:
@@ -722,7 +788,8 @@ async def _log_trajectory(session_id: str, goal: str, answer: str,
         pass
 
 
-async def _trajectory_audit(answer: str, tool_names: list[str]) -> tuple[str, str | None, str | None]:
+async def _trajectory_audit(answer: str, tool_names: list[str],
+                            goal: str = "") -> tuple[str, str | None, str | None]:
     """One low-temp self-audit: which load-bearing claims were CHECKED with a
     tool vs ASSERTED. Returns (verified, pattern, toolnote). `pattern` is a
     candidate for learned.md `## pending` — a GENUINE FAILURE only (the agent
@@ -746,7 +813,13 @@ async def _trajectory_audit(answer: str, tool_names: list[str]) -> tuple[str, st
                          "tool vs merely asserted>\n"
                          "PATTERN: <one line — a GENUINE FAILURE only: something the agent did "
                          "concretely wrong, or failed/errored to deliver, that the user would be "
-                         "disappointed by. Phrase it 'I <wrong behavior> → **Fix.**'. If the task "
+                         "disappointed by, JUDGED AGAINST THE USER'S REQUEST below (a short "
+                         "greeting answering a greeting is correct, not a failure; facts the "
+                         "agent's system prompt supplies — the model name, date, cwd, the user's "
+                         "profile — count as verified, not asserted). Phrase it "
+                         "'I <wrong behavior> → **<short fix rule>.** <one sentence: how>' — e.g. "
+                         "'I claimed the deploy worked without running it → **Verify before "
+                         "asserting.** Run the command and quote its result.' If the task "
                          "succeeded, the user's standing preference was simply met, nothing was "
                          "wrong, or it matches an ACTIVE RULE below — write NONE. Never log a "
                          "preference, taste, style opinion, or a re-wording of an active rule. "
@@ -759,7 +832,11 @@ async def _trajectory_audit(answer: str, tool_names: list[str]) -> tuple[str, st
                          "ACTIVE RULES (already learned — do not re-log these):\n"
                          f"{active_txt}")},
             {"role": "user",
-             "content": f"TOOLS USED (in order):\n{tools}\n\nFINAL ANSWER:\n{answer[:6000]}"},
+             "content": (f"USER'S REQUEST:\n{(goal or '(unknown)')[:2000]}\n\n"
+                         f"FACTS IN THE AGENT'S SYSTEM PROMPT (verified):"
+                         f"{_model_identity_block().rstrip()} Today is "
+                         f"{datetime.date.today().isoformat()}.\n\n"
+                         f"TOOLS USED (in order):\n{tools}\n\nFINAL ANSWER:\n{answer[:6000]}")},
             # thinking off: a 3-line format task needs no chain-of-thought —
             # at the server default (xhigh) the call burned the 60s budget and
             # came back unparseable (audit usable in only 23% of runs).
@@ -777,7 +854,32 @@ async def _trajectory_audit(answer: str, tool_names: list[str]) -> tuple[str, st
         elif ls.upper().startswith("PATTERN:"):
             p = ls.split(":", 1)[1].strip()
             pattern = None if p.upper() == "NONE" else p
+            # 2026-11-08: reject malformed lessons — gpt-oss copied the old
+            # template literally ("… → **Fix.**", no rule); an empty fix
+            # phrase can't be family-grouped or acted on
+            if pattern:
+                fm = re.search(r"→\s*\*\*([^*]{4,100})\*\*", pattern)
+                if not fm or fm.group(1).strip().lower().rstrip(".") in (
+                        "fix", "fix it", "<short fix rule>"):
+                    pattern = None
     return verified or "(no audit output)", pattern, toolnote
+
+
+#: typographic dashes some models (gpt-oss) emit everywhere — inside a URL
+#: they make a different, dead address (2026-11-08: the "live link"
+#: https://jblagana.github.io/jan‑profile‑test/ used U+2011 → 404)
+_UNICODE_DASHES = "‐‑‒–−﹣－"
+_URL_RE = re.compile(r"https?://[^\s<>()\"'`\]]+")
+
+
+def _fix_url_dashes(text: str) -> str:
+    """Replace Unicode dashes with ASCII '-' inside URLs only."""
+    try:
+        return _URL_RE.sub(
+            lambda m: m.group(0).translate({ord(c): "-" for c in _UNICODE_DASHES}),
+            text or "")
+    except Exception:  # noqa: BLE001
+        return text
 
 
 def _parse_text_tool(draft: str) -> dict | None:
@@ -1258,6 +1360,67 @@ def _clear_old_tool_results(messages: list[dict], recent: int) -> int:
     return freed
 
 
+#: inline cap for a tool result in the model's context (was a flat 12,000-char
+#: head cut). Successful big results already spill to disk at
+#: RESULT_SPILL_THRESHOLD; what reaches here oversized is mostly FAILURE
+#: output, whose useful part (the error / traceback) sits at the END — keep
+#: head + tail.
+INLINE_RESULT_CAP = 6000
+
+
+def _inline_cap(text: str, cap: int = INLINE_RESULT_CAP) -> str:
+    text = text or ""
+    if len(text) <= cap:
+        return text
+    head, tail = int(cap * 0.65), int(cap * 0.3)
+    return (text[:head] + f"\n…[{len(text) - head - tail:,} chars omitted]…\n"
+            + text[-tail:])
+
+
+def _clear_tool_results_batch(messages: list[dict], target_tokens: int,
+                              keep_results: int) -> int:
+    """Token diet (2026-11-08): stub tool results OLDEST-FIRST until the
+    estimate drops to `target_tokens`, always keeping the newest
+    `keep_results` results whole. One batch per crossing of
+    COMPACT_CLEAR_AT (hysteresis) instead of a rewrite every round — so the
+    provider's cached prefix stays valid for many rounds. Lossless in the
+    same sense as _clear_old_tool_results (calls + conversation text stay;
+    the model can re-run a tool). Returns chars freed."""
+    idx = []
+    for i, m in enumerate(messages[1:], start=1):
+        c = m.get("content")
+        if m.get("role") == "tool":
+            t = _content_text(c)
+            if t and not t.startswith("[cleared:"):
+                idx.append(i)
+        elif (m.get("role") == "user" and isinstance(c, str)
+              and c.startswith("TOOL_RESULT:")
+              and not c[len("TOOL_RESULT:"):].lstrip().startswith("[cleared")):
+            idx.append(i)
+    if keep_results > 0:
+        idx = idx[:-keep_results] if len(idx) > keep_results else []
+    names: dict[str, str] = {}
+    for m in messages:
+        for tc in (m.get("tool_calls") or []):
+            names[tc.get("id") or ""] = (tc.get("function") or {}).get("name", "?")
+    freed = 0
+    for i in idx:
+        if est_tokens(messages) <= target_tokens:
+            break
+        m = messages[i]
+        if m.get("role") == "tool":
+            text = _content_text(m.get("content"))
+            name = names.get(m.get("tool_call_id") or "", "?")
+            stub = f"[cleared: {name} — {len(text):,} chars; re-run the tool if needed]"
+        else:
+            text = m["content"][len("TOOL_RESULT:"):]
+            stub = ("TOOL_RESULT:\n[cleared — "
+                    f"{len(text):,} chars; re-run the tool if needed]")
+        m["content"] = stub
+        freed += max(0, len(text) - len(stub))
+    return freed
+
+
 class ThinkingLoop(Exception):
     """Streaming repetition tripwire: the model's thinking stream degenerated
     into a token loop (the 480 KB 'Narakeets = Narakeets…' run, 2026-10-06).
@@ -1730,9 +1893,11 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
             {"role": "system",
              "content": build_system(cwd, _llm.mode == "text", plan_mode,
                                      roast, recall=saved_state.get("goal") or "",
-                                     session_id=session_id)}]
+                                     session_id=session_id, volatile=False)}]
         messages.extend(saved_state["messages"])
         messages.append({"role": "user", "content": user_text})
+        _attach_volatile(messages, volatile_context(
+            session_id, saved_state.get("goal") or ""))
         # unflag a parked (deliberately-stopped) run BEFORE the row is
         # consumed: the row is deleted here and re-created at the next
         # checkpoint (which writes stopped=0 anyway), but a crash between
@@ -1760,7 +1925,7 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
             {"role": "system",
              "content": build_system(cwd, _llm.mode == "text", plan_mode,
                                      roast, recall=user_text,
-                                     session_id=session_id)}]
+                                     session_id=session_id, volatile=False)}]
         comp = sess.get("compacted_summary")
         comp_id = int(sess.get("compacted_through_msg_id") or 0)
         # fetch generously (each row is clamped to 24k chars ≈ 6k tokens;
@@ -1847,9 +2012,12 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
                                          *image_parts]})
         else:
             messages.append({"role": "user", "content": model_text})
+        _attach_volatile(messages, volatile_context(session_id, user_text))
         turn = 0
 
-    schemas = openai_schemas(exclude=MUTATING_TOOLS if plan_mode else None)
+    # optional tool groups stay out of the request until load_tools (token diet)
+    schemas = openai_schemas(exclude=schema_exclude(
+        _loaded_tool_groups.get(session_id), MUTATING_TOOLS if plan_mode else None))
 
     def _sync_mode() -> str | None:
         """Mid-flight mode sync: the Plan/Act toggle is LIVE, not a
@@ -1871,9 +2039,10 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
                                "content": build_system(
                                    cwd, _llm.mode == "text",
                                    plan_mode, roast,
-                                   session_id=session_id)}
-                schemas = openai_schemas(
-                    exclude=MUTATING_TOOLS if plan_mode else None)
+                                   session_id=session_id, volatile=False)}
+                schemas = openai_schemas(exclude=schema_exclude(
+                    _loaded_tool_groups.get(session_id),
+                    MUTATING_TOOLS if plan_mode else None))
                 log("info", f"mid-flight mode: "
                             f"{'demoted to Plan' if plan_mode else 'back to Act'}")
                 return ("⏸ Plan mode — demoted mid-run"
@@ -1883,6 +2052,9 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
         return None
 
     thinking_text = ""                    # model chain-of-thought, this turn
+    tool_call_retries = 0                 # malformed-tool-call re-asks this turn (cap 3)
+    cmd_fail_streak = 0                   # consecutive failed run_commands (loop brake)
+    round_warned = 0                      # last round a long-task note was added
     parts: list[dict] = []                # natural-order timeline of the turn:
     # {"t":"text","text":…} segments and {"t":"tool",…} runs, in the order
     # they happened — persisted on the message so history renders like live
@@ -1947,10 +2119,19 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
             # LLM summary still waits for the turn-boundary compaction.
             # Overflow recovery's aggressive clear is the backstop and is
             # untouched by this flag.
+            # Token diet (ported 2026-11-08): the clear starts at
+            # COMPACT_CLEAR_AT (40k, not the 100k trigger) and cuts to
+            # COMPACT_CLEAR_TO in one batch (hysteresis — cache-safe); past
+            # the full trigger the old keep-tail clear is the backstop.
+            clear_at = min(settings.compact_clear_at, settings.compact_trigger)
             if (settings.compact_enabled and settings.compact_mid_turn_clear
                     and turn > 1
-                    and ctx_now >= settings.compact_trigger):
-                freed = _clear_old_tool_results(messages, settings.compact_recent)
+                    and ctx_now >= clear_at):
+                freed = _clear_tool_results_batch(
+                    messages, settings.compact_clear_to,
+                    settings.compact_keep_tool_results)
+                if not freed and ctx_now >= settings.compact_trigger:
+                    freed = _clear_old_tool_results(messages, settings.compact_recent)
                 if freed:
                     log("info", f"cleared old tool results mid-turn (~{freed // 4} est tokens freed)")
                     # the pre-clear real number is now stale (the context
@@ -2095,12 +2276,30 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
                             f"early (turn {turn})")
                 yield sse("status", {"text": "Thinking loop detected — "
                                              "aborting this round"})
+            except ToolCallFailed as e:
+                # the model's tool call was malformed (Groq tool_use_failed …)
+                # — keep native tools, tell the model, re-run the round
+                tool_call_retries += 1
+                if tool_call_retries > 3:
+                    log("warn", f"session {session_id[:8]}: malformed tool call "
+                                f"×{tool_call_retries} — giving up: {str(e)[:160]}")
+                    raise  # outer LLMError handler: error frame + persistence
+                log("warn", f"session {session_id[:8]}: malformed tool call "
+                            f"(retry {tool_call_retries}/3): {str(e)[:160]}")
+                messages.append({"role": "user", "content": (
+                    "[harness] Your previous tool call was rejected by the API as "
+                    "malformed: " + str(e)[:300] + "\nRe-issue it as ONE valid tool "
+                    "call with well-formed JSON arguments. If the command needs "
+                    "nested quotes or JSON, write a .ps1 or body file with "
+                    "write_file first and run that instead.")})
+                yield sse("status", {"text": "Malformed tool call — asking the model to retry…"})
+                continue
             except ToolUnsupported as e:
                 log("warn", f"server rejected tools ({e}) — switching to text protocol")
                 _llm.mode = "text"
                 messages[0] = {"role": "system",
                                "content": build_system(cwd, True, plan_mode, roast,
-                                                       session_id=session_id)}
+                                   session_id=session_id, volatile=False)}
                 yield sse("status", {"text": "Falling back to text tool protocol…"})
                 continue
             except LLMError as e:
@@ -2213,6 +2412,22 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
                     for held in lines_held:
                         draft += held + "\n"
                         yield sse("token", {"text": held + "\n"})
+                # Reasoning models on the text protocol sometimes write the
+                # TOOL_CALL line inside their REASONING and leave the answer
+                # empty (gpt-oss, 2026-11-08 image chat → "empty answer").
+                # Nothing visible came out and no call was parsed → take the
+                # LAST complete TOOL_CALL line from this round's thinking.
+                if not tool_calls and not draft.strip():
+                    round_think = thinking_text[think_t0:]
+                    cand = [ln for ln in round_think.splitlines()
+                            if ln.lstrip().startswith("TOOL_CALL:")]
+                    for ln in reversed(cand):
+                        tc = _parse_text_tool(ln.strip() + "\n")
+                        if tc:
+                            tool_calls[900 + len(tool_calls)] = tc
+                            log("warn", f"session {session_id[:8]}: TOOL_CALL "
+                                        f"recovered from reasoning ({tc['name']})")
+                            break
                 lines_held = []
 
             # progress bar: pick up the model's "STEP:" plan (first time seen)
@@ -2334,6 +2549,24 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
                                   "retry it; continue planning and answer with your "
                                   "step-by-step plan for the requested change.")
                         log("tool", f"{name} blocked (plan mode)")
+                    elif name == "load_tools":
+                        # on-demand tool groups (token diet 2026-11-08)
+                        req = args.get("groups") or []
+                        if isinstance(req, str):
+                            req = [req]
+                        valid = [g for g in req if g in OPTIONAL_TOOL_GROUPS]
+                        bad = [g for g in req if g not in OPTIONAL_TOOL_GROUPS]
+                        if valid:
+                            _loaded_tool_groups.setdefault(session_id, set()).update(valid)
+                            schemas = openai_schemas(exclude=schema_exclude(
+                                _loaded_tool_groups.get(session_id),
+                                MUTATING_TOOLS if plan_mode else None))
+                        names = [n for g in valid for n in OPTIONAL_TOOL_GROUPS[g][0]]
+                        result = ((f"Loaded {', '.join(valid)} — now callable: "
+                                   f"{', '.join(names)}." if valid else "Nothing loaded.")
+                                  + (f" Unknown group(s): {', '.join(bad)}; valid: "
+                                     f"{', '.join(OPTIONAL_TOOL_GROUPS)}." if bad else ""))
+                        log("tool", f"load_tools {valid or req}")
                     elif name == "run_command":
                         cmd = str(args.get("command") or "")
                         run_cwd = cwd
@@ -2503,7 +2736,43 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
                         result = ((result[:mimg.start()] + result[mimg.end():]).strip()
                                   or "[browser screenshot] (image attached to the model)")
                     ms = int((time.time() - t0) * 1000)
-                    ok = not result.startswith("error:")
+                    # a non-zero exit is a failure too (2026-11-08: "Repository
+                    # not found … [exit code 1]" rendered green and counted as
+                    # real work for the unverified-claim check)
+                    ok = not result.startswith("error:") and not re.search(
+                        r"\[exit code (?!0\])\d+\]\s*$", result)
+                    # Loop brake (2026-11-08: ~30 near-identical failing
+                    # commands in a row on one quoting bug). Every 4th
+                    # consecutive run_command failure, prepend a harness note
+                    # (top, so truncation can't eat it) forcing a change of
+                    # strategy instead of another variant of the same line.
+                    if name == "run_command":
+                        cmd_fail_streak = 0 if ok else cmd_fail_streak + 1
+                        if cmd_fail_streak and cmd_fail_streak % 4 == 0:
+                            result = (
+                                f"[harness] {cmd_fail_streak} commands in a row have "
+                                "FAILED. Stop retrying variants of the same command. "
+                                "Read the error above literally and change approach: "
+                                "write the logic to a .ps1 file with write_file and run "
+                                "it, avoid nested quoting, use curl.exe / "
+                                "Invoke-RestMethod (not `curl`), or — if something "
+                                "outside your control blocks you — stop and tell the "
+                                "user exactly what is blocking.\n\n" + result)
+                    # Long-task brake (token diet 2026-11-08: one 443-round
+                    # task cost 52M input tokens — every round resends the
+                    # whole context). Once per crossing: at ROUND_WARN_AT and
+                    # every ROUND_WARN_EVERY after.
+                    if (settings.round_warn_at > 0 and turn >= settings.round_warn_at
+                            and turn != round_warned
+                            and (turn - settings.round_warn_at)
+                            % max(1, settings.round_warn_every) == 0):
+                        round_warned = turn
+                        result = (
+                            f"[harness] This task is at round {turn}; every round "
+                            "re-sends the whole conversation. Batch independent tool "
+                            "calls into one round, record progress with note_fact, "
+                            "and wrap up: finish, or stop with a summary of what is "
+                            "done and what remains.\n\n" + result)
                     # pass-by-reference: one choke point — big successful
                     # results spill to a file on disk; the model gets a preview
                     # + the path (it pags back with read_file / search_files).
@@ -2542,7 +2811,7 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
                     if _llm.mode == "text":
                         messages.append({"role": "assistant", "content": draft})
                         messages.append({"role": "user",
-                                         "content": "TOOL_RESULT:\n" + result[:12000]})
+                                         "content": "TOOL_RESULT:\n" + _inline_cap(result)})
                     else:
                         tid = tc.get("id") or f"call_{idx}"
                         messages.append({
@@ -2556,7 +2825,7 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
                         # image_url part, so the model sees the pixels.
                         if shot_b64:
                             content = []
-                            text_part = result[:12000].strip()
+                            text_part = _inline_cap(result).strip()
                             if text_part:
                                 content.append({"type": "text", "text": text_part})
                             content.append({"type": "image_url", "image_url": {
@@ -2565,11 +2834,11 @@ async def run_chat(session_id: str, user_text: str, files: list[dict],
                                              "content": content})
                         else:
                             messages.append({"role": "tool", "tool_call_id": tid,
-                                             "content": result[:12000]})
+                                             "content": _inline_cap(result)})
                 draft = ""
                 continue
             # ── no tool calls: this is the final answer ──
-            answer = draft.strip()
+            answer = _fix_url_dashes(draft.strip())
             if think_loop_tripped:
                 # the tripwire aborted the round mid-thinking: emit a short
                 # clarification instead of the empty-answer stop (the old

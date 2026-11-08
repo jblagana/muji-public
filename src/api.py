@@ -383,7 +383,112 @@ async def api_config():
         "compact_trigger": settings.compact_trigger,
         "compact_boundary": settings.compact_boundary,
         "compact_enabled": settings.compact_enabled,
+        "active_profile": settings.active_profile,
     }
+
+
+# ── model profiles (bottom-bar switcher + "Manage profiles…" panel) ──
+# Keys are write-only from the UI's side: they go into the OS keychain and
+# are never returned — GET only reports key_set + a last-4 hint.
+
+def _model_payload() -> dict:
+    return {"profiles": {n: settings.profile_public(n) for n in settings.profiles},
+            "active": settings.active_profile}
+
+
+@app.get("/api/model")
+async def api_model_get():
+    return _model_payload()
+
+
+@app.post("/api/model")
+async def api_model_switch(request: Request):
+    body = await request.json()
+    active = settings.set_profile(str(body.get("profile") or body.get("name") or ""))
+    return {"ok": True, "active": active,
+            "key_set": bool(settings.profile_key(active)),
+            "profiles": _model_payload()["profiles"]}
+
+
+@app.put("/api/model/profiles/{name}")
+async def api_model_upsert(name: str, request: Request):
+    body = await request.json()
+    try:
+        settings.upsert_profile(name, body, api_key=body.get("api_key") or None,
+                                clear_key=bool(body.get("clear_key")))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:  # keychain write failed — never fall back to a file
+        raise HTTPException(500, f"couldn't save the key to the OS keychain: {e}")
+    return {"ok": True, **_model_payload()}
+
+
+@app.delete("/api/model/profiles/{name}")
+async def api_model_delete(name: str):
+    try:
+        settings.delete_profile(name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except KeyError:
+        raise HTTPException(404, "unknown profile")
+    return {"ok": True, **_model_payload()}
+
+
+@app.post("/api/model/test")
+async def api_model_test(request: Request):
+    """Probe an endpoint with GET {base_url}/models (base_url, or a saved
+    profile's `name`; blank api_key = that profile's saved key)."""
+    body = await request.json()
+    name = str(body.get("name") or "")
+    base_url = (body.get("base_url") or "").strip().rstrip("/")
+    if not base_url and name in settings.profiles:
+        base_url = settings.profiles[name]["base_url"].rstrip("/")
+    if not re.match(r"^https?://[^\s/]+", base_url):
+        raise HTTPException(400, "base URL must start with http:// or https://")
+    key = (body.get("api_key") or "").strip() or (
+        settings.profile_key(name) if name in settings.profiles else "")
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    try:
+        async with httpx.AsyncClient(timeout=12) as c:
+            r = await c.get(base_url + "/models", headers=headers)
+    except Exception as e:
+        return {"ok": False, "error": f"connection failed: {type(e).__name__}: {e}"}
+    if r.status_code != 200:
+        return {"ok": False, "status": r.status_code,
+                "error": f"HTTP {r.status_code}: {r.text[:300]}"}
+    # Model list + per-model metadata, normalised across providers (the UI
+    # pre-fills context / max output / vision from it when you pick a model):
+    #   Groq        context_window, max_completion_tokens
+    #   OpenRouter  context_length, top_provider.max_completion_tokens,
+    #               architecture.input_modalities
+    #   Together    a bare list; context_length
+    #   vLLM        max_model_len
+    try:
+        payload = r.json()
+    except Exception:
+        payload = {}
+    items = payload if isinstance(payload, list) else (payload.get("data") or [])
+    non_chat = re.compile(r"whisper|tts|orpheus|guard|embed|moderation|dall-e|"
+                          r"image-gen|transcri|rerank|audio", re.I)
+    meta: dict[str, dict] = {}
+    for m in items:
+        if not isinstance(m, dict) or not m.get("id"):
+            continue
+        mid = str(m["id"])
+        top = m.get("top_provider") or {}
+        arch = m.get("architecture") or {}
+        mods = arch.get("input_modalities") or []
+        meta[mid] = {
+            "context_window": (m.get("context_window") or m.get("context_length")
+                               or top.get("context_length") or m.get("max_model_len")),
+            "max_output": m.get("max_completion_tokens") or top.get("max_completion_tokens"),
+            "vision": ("image" in mods) if mods else None,
+            "chat": not non_chat.search(mid),
+        }
+    chat_ids = sorted(i for i, v in meta.items() if v["chat"])
+    ids = chat_ids or sorted(meta)
+    return {"ok": True, "models": ids[:500],
+            "meta": {i: meta[i] for i in ids[:500]}}
 
 
 # ── First-run setup ────────────────────────────────────────────────────
